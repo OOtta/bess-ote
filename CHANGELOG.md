@@ -25,3 +25,5 @@ First version of **bess-ote** (BESS OTE kalkulačka).
 - OTE prices (hourly CZK until 2025-09-30, 15-minute EUR from 2025-10-01 converted with the
   ČNB rate of the delivery day) and ČNB rates with a persistent per-day cache (from
   egd-api-client); TOML config; Windows/Termux-safe output; Python 3.11–3.14.
+- Czech README explains the negative-price modes for purchase and sale
+  (`--buy-negative`, `--sell-negative`) with example tables.

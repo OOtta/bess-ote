@@ -26,6 +26,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
 - [Rychlý start](#rychlý-start)
 - [Příkazy a volby](#příkazy-a-volby)
 - [Jak se počítá cena](#jak-se-počítá-cena)
+  - [Záporné ceny (`--buy-negative`, `--sell-negative`)](#záporné-ceny---buy-negative---sell-negative)
 - [Algoritmus](#algoritmus)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
 - [Výstupy](#výstupy)
@@ -141,7 +142,7 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `-m`, `--buy-multiplier X` | násobek spotové ceny | 1 |
 | `-a`, `--buy-add KČ_MWH` | přirážka dodavatele | 0 |
 | `--buy-negative-multiplier X`, `--buy-negative-add KČ_MWH` | jiný vzorec pro záporné spotové ceny | = normální |
-| `--buy-negative as-is\|clamp-spot\|clamp-total` | zacházení se zápornými cenami | `as-is` |
+| `--buy-negative as-is\|clamp-spot\|clamp-total` | zacházení se zápornými cenami, viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative) | `as-is` |
 | `--buy-vat PCT` | DPH na nákup (energie + distribuce + poplatky) | 0 |
 
 **Výkup (spot × násobek + přirážka)**
@@ -150,7 +151,7 @@ pro oba příkazy (kromě posledních dvou tabulek).
 |---|---|---|
 | `--sell-multiplier X` | násobek | 1 |
 | `--sell-add KČ_MWH` | přirážka, obvykle záporná = poplatek výkupce (např. `-300`) | 0 |
-| `--sell-negative-multiplier`, `--sell-negative-add`, `--sell-negative` | jako u nákupu | = normální |
+| `--sell-negative-multiplier`, `--sell-negative-add`, `--sell-negative` | jako u nákupu, viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative) | = normální |
 | `--sell-vat PCT` | DPH přičtená k tržbě (jen plátci DPH) | 0 |
 
 **Distribuce a poplatky (jen na nakoupenou energii)**
@@ -199,15 +200,73 @@ nákup  [Kč/kWh] = ( (spot × m + a) / 1000 + distribuce(VT/NT) + poplatky ) ×
 výkup  [Kč/kWh] = ( spot × m_v + a_v ) / 1000 × (1 + DPH výkup)
 ```
 
-- Pro **záporný spot** (< 0) se použijí koeficienty `--…-negative-multiplier` / `--…-negative-add`
-  (co není zadáno, převezme normální hodnotu). `clamp-spot` nahradí záporný spot nulou před
-  výpočtem, `clamp-total` ořízne výsledek na 0. Stejně jako v
-  [egd-api-client](https://github.com/OOtta/egd-api-client).
+- Pro **záporný spot** platí vlastní koeficienty a režimy `--buy-negative` /
+  `--sell-negative` – viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative).
 - Distribuce se podle časů NT počítá po čtvrthodinách v místním čase (správně i ve dnech
   přechodu na letní/zimní čas); čtvrthodina, která NT protíná jen částí, dostane vážený průměr.
 - **Měsíční paušály** (jistič, poplatek dodavateli) arbitráž neovlivní, proto se nezadávají.
 - Ceny OTE: do 30. 9. 2025 hodinové ceny v Kč (každá platí pro 4 čtvrthodiny), od 1. 10. 2025
   čtvrthodinové ceny v EUR přepočtené kurzem ČNB platným pro den dodávky.
+
+### Záporné ceny (`--buy-negative`, `--sell-negative`)
+
+Při záporné spotové ceně OTE se smlouvy dodavatelů i výkupců liší, proto se nákup i výkup
+nastavuje zvlášť, ve dvou krocích:
+
+1. **Které koeficienty platí.** Pro čtvrthodinu se záporným spotem (ostře pod 0) se použije
+   `--buy-negative-multiplier` / `--buy-negative-add` (u výkupu `--sell-negative-multiplier` /
+   `--sell-negative-add`); co není zadáno, převezme se z běžného násobku / přirážky. O výběru
+   rozhoduje znaménko **původní** ceny OTE – ještě před jakýmkoli ořezáním.
+2. **Jak se se zápornou cenou naloží** (`--buy-negative`, `--sell-negative`, v konfiguraci
+   `negative` v sekci `[buy]` / `[sell]`):
+   * `as-is` (výchozí) – záporný spot se použije tak, jak je; po vynásobení a přičtení
+     přirážky může vyjít záporná cena;
+   * `clamp-spot` – záporný spot se **nejdřív nahradí nulou** a teprve pak se použijí
+     koeficienty, platí tedy jen přirážka;
+   * `clamp-total` – cena se spočítá s koeficienty a **výsledek se ořízne zdola na 0**.
+
+**Nákup** (`--buy-negative`) – co znamená pro vás jako kupujícího:
+
+* `as-is` – záporná nákupní cena = **za nákup (nabíjení) dostanete zaplaceno**; optimalizátor
+  v takové čtvrthodině rád nabíjí;
+* `clamp-spot` – zaplatíte jen přirážku (spot −500, přirážka +400 → 400 Kč/MWh);
+* `clamp-total` – za nákup nikdy nedostanete zaplaceno, ale může být levnější než přirážka
+  (−500 + 400 = −100 → 0; −200 + 400 = 200).
+
+Ceny energie v Kč/MWh bez DPH a bez distribuce (distribuce a poplatky se k nákupu připočítají
+vždy):
+
+| Spot OTE | Nákup: koeficienty | `as-is` | `clamp-spot` | `clamp-total` |
+|---:|---|---:|---:|---:|
+| 1 000 | × 1, + 400 | 1 400 | 1 400 | 1 400 |
+| −200 | × 1, + 400 | 200 | 400 | 200 |
+| −500 | × 1, + 400 | −100 | 400 | 0 |
+| −500 | × 1,15, + 400 | −175 | 400 | 0 |
+| −500 | × 1,15, + 400; při záporném spotu × 1, + 0 | −500 | 0 | 0 |
+
+**Výkup** (`--sell-negative`) – z pohledu prodávajícího (přirážka u výkupu bývá záporná =
+poplatek výkupce, např. `--sell-add -300`):
+
+* `as-is` – záporná výkupní cena = **za prodej (vybíjení do sítě) platíte**; optimalizátor
+  v takové čtvrthodině nevybíjí;
+* `clamp-spot` – záporný spot se bere jako 0, zůstane jen přirážka; se záporným poplatkem
+  výkupce tedy za prodej stále platíte (−300 Kč/MWh);
+* `clamp-total` – výsledek se ořízne na 0: **za prodej nikdy neplatíte**, při záporné ceně
+  prostě nedostanete nic.
+
+| Spot OTE | Výkup: koeficienty | `as-is` | `clamp-spot` | `clamp-total` |
+|---:|---|---:|---:|---:|
+| 1 000 | × 1, − 300 | 700 | 700 | 700 |
+| 200 | × 1, − 300 | −100 | −100 | 0 |
+| −200 | × 1, − 300 | −500 | −300 | 0 |
+| −500 | × 1, − 300 | −800 | −300 | 0 |
+| −500 | × 1, − 300; při záporném spotu × 1, + 0 | −500 | 0 | 0 |
+
+`clamp-total` ořezává každou zápornou výslednou cenu, tedy i kladný spot pod výší poplatku
+(řádek se spotem 200), `clamp-spot` jen záporný spot. Kladné ceny nad poplatkem režim nijak
+neovlivní. Jak to dělá váš dodavatel / výkupce, najdete ve smlouvě nebo v ceníku (obvykle
+u definice ceny pro „hodiny se zápornou cenou“). Stejná pravidla používá
+[egd-api-client](https://github.com/OOtta/egd-api-client).
 
 ## Algoritmus
 
