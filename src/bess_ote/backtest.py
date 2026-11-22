@@ -31,9 +31,8 @@ from bess_ote.optimizer import (
     Step,
     Terminal,
     _grid,
-    rollout,
-    solve,
     solve_choice,
+    solve_rollout,
     step_at,
 )
 from bess_ote.parallel import MIN_UNITS_PER_WORKER, make_process_pool, resolve_jobs
@@ -243,10 +242,14 @@ def run_backtest(
             warnings.append("Perfect-foresight benchmark skipped: the period has gaps.")
 
     # 3) DP backward passes – serial or in parallel
-    fsol, workers = _solve_all(battery, events, fprob, resolve_jobs(jobs), report, n_days)
+    levels, k0, deltas = _grid(battery)
+    grid0 = Solution(battery, levels, deltas, np.empty((0, 0)), np.empty(0), np.empty(0),
+                     np.empty(0), k0)  # fmt: skip
+    snapped = float(levels[grid0.state_index(initial_soc_kwh)])
+    fsteps, workers = _solve_all(battery, events, fprob, resolve_jobs(jobs), report, n_days,
+                                 snapped)  # fmt: skip
 
     # 4) forward pass: carry the state of charge through the decision tables (sequential)
-    levels, k0, deltas = _grid(battery)
     sols = [
         Solution(battery, levels, deltas, ev.choice, np.empty(0), ev.prob.buy, ev.prob.sell, k0)
         for ev in events
@@ -280,9 +283,9 @@ def run_backtest(
         res.fees_by_day[d] = tariffs.fees_for_day(d)
         d += timedelta(days=1)
     res.totals.fees_czk = sum(res.fees_by_day.values())
-    if fsol is not None:
+    if fsteps is not None:
         ft = Totals()
-        steps = rollout(fsol, snapped_initial)
+        steps = fsteps
         for i, s in enumerate(steps):
             ft.add(Interval(intervals_starts[i], math.nan, 0, 0, s, intervals_starts[-1]))
         ft.fees_czk = res.totals.fees_czk
@@ -299,8 +302,9 @@ def _solve_all(
     jobs: int,
     report: Callable[[str, float, str], None],
     n_days: int,
-) -> tuple[Solution | None, int]:
-    """Fill ``ev.choice`` for every event; returns (perfect-foresight solution, workers)."""
+    snapped_initial: float,
+) -> tuple[list[Step] | None, int]:
+    """Fill ``ev.choice`` for every event; returns (perfect-foresight steps, workers)."""
     rolling_units = sum(len(ev.prob.starts) for ev in events)
     f_units = len(fprob.starts) if fprob is not None else 0
     total = max(1, rolling_units + f_units)
@@ -321,7 +325,7 @@ def _solve_all(
             state["rolling"] += len(ev.prob.starts)
             state["keep"] += ev.keep
 
-    def solve_foresight() -> Solution | None:
+    def solve_foresight() -> list[Step] | None:
         if fprob is None:
             return None
 
@@ -329,10 +333,10 @@ def _solve_all(
             with lock:
                 state["f"] = f
 
-        sol = solve(battery, fprob.buy, fprob.sell, fprob.terminal, cb)
+        steps = solve_rollout(battery, fprob.buy, fprob.sell, fprob.terminal, snapped_initial, cb)
         with lock:
             state["f"] = 1.0
-        return sol
+        return steps
 
     def serial(todo: list[_Event]) -> None:
         for ev in todo:
@@ -383,7 +387,7 @@ def _solve_all(
     return _result(fres), workers
 
 
-def _threaded(fn: Callable[[], Solution | None], emit: Callable[[], None]) -> Solution | None:
+def _threaded(fn: Callable[[], list[Step] | None], emit: Callable[[], None]) -> list[Step] | None:
     """Run ``fn`` on a helper thread while this thread reports progress every 0.1 s."""
     out: dict[str, Any] = {}
     th = threading.Thread(target=_capture, args=(fn, out), daemon=True)
@@ -395,14 +399,14 @@ def _threaded(fn: Callable[[], Solution | None], emit: Callable[[], None]) -> So
     return _result(out)
 
 
-def _capture(fn: Callable[[], Solution | None], out: dict[str, Any]) -> None:
+def _capture(fn: Callable[[], list[Step] | None], out: dict[str, Any]) -> None:
     try:
         out["sol"] = fn()
     except BaseException as exc:  # re-raised in the calling thread by _result
         out["error"] = exc
 
 
-def _result(out: dict[str, Any]) -> Solution | None:
+def _result(out: dict[str, Any]) -> list[Step] | None:
     if "error" in out:
         raise out["error"]
     return out.get("sol")

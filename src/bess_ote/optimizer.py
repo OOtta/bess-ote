@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import numpy as np
@@ -68,7 +68,7 @@ class Solution:
 
     def state_index(self, kwh: float) -> int:
         """Nearest grid state for a stored energy (clamped to the allowed SoC range)."""
-        k = round(kwh / self.battery.step) - self.k0
+        k = round((kwh - float(self.levels[0])) / self.battery.step)
         return int(min(max(k, 0), len(self.levels) - 1))
 
 
@@ -94,11 +94,12 @@ class Step:
 
 def _grid(b: Battery) -> tuple[np.ndarray, int, np.ndarray]:
     g = b.step
-    k_min = math.ceil(b.e_min / g - 1e-9)
-    k_max = math.floor(b.e_max / g + 1e-9)
-    levels = np.arange(k_min, k_max + 1) * g
-    up = math.floor(b.charge_kw * DT_H * b.charge_eff / g + 1e-9)
-    down = math.floor(b.p_dis * DT_H / b.discharge_eff / g + 1e-9)
+    # anchored at min SoC: min SoC exact, usable steps = floor(usable / g) (monotone in size)
+    n = math.floor(b.usable_kwh / g + 1e-9)
+    levels = b.e_min + np.arange(n + 1) * g
+    k_min = 0
+    up = math.floor(b.charge_q_kwh / g + 1e-9)
+    down = math.floor(b.discharge_q_kwh / g + 1e-9)
     order = sorted(range(-down, up + 1), key=lambda j: (abs(j), -j))  # prefer small actions
     return levels, k_min, np.array(order, dtype=np.int64)
 
@@ -116,6 +117,64 @@ def action_costs(b: Battery, buy: np.ndarray, sell: np.ndarray, deltas: np.ndarr
     return np.where(np.isnan(cost), _BIG, cost)
 
 
+def _setup(b: Battery, buy: np.ndarray, sell: np.ndarray, terminal: Terminal):
+    buy = np.asarray(buy, dtype=np.float64)
+    sell = np.asarray(sell, dtype=np.float64)
+    levels, k0, deltas = _grid(b)
+    s = len(levels)
+    if terminal.mode == "value":
+        v = -levels * terminal.czk_per_kwh_stored
+    elif terminal.mode == "min-soc":
+        v = np.maximum(0.0, terminal.min_kwh - levels - 1e-9) * _SHORTFALL_PENALTY
+    else:
+        v = np.zeros(s)
+    target = np.arange(s)[:, None] + deltas[None, :]  # transition table (state, action)
+    valid = (target >= 0) & (target < s)
+    target = np.where(valid, target, s)  # index s = padded infeasible state
+    costs = action_costs(b, buy, sell, deltas)
+    return buy, sell, levels, k0, deltas, v, target, costs
+
+
+def _choice_dtype(actions: int) -> type:
+    return np.int8 if actions <= 127 else np.int16 if actions < 32000 else np.int32
+
+
+def _backward(
+    v: np.ndarray,
+    target: np.ndarray,
+    costs: np.ndarray,
+    t_hi: int,
+    t_lo: int,
+    store: np.ndarray | None = None,
+    store_from: int = 0,
+    tick: Callable[[int], None] | None = None,
+    checkpoints: dict[int, np.ndarray] | None = None,
+    every: int = 0,
+) -> np.ndarray:
+    """``V_t`` for t = t_hi−1 … t_lo from ``v`` = ``V_{t_hi}``; decisions of t ≥ store_from
+    go to ``store[t − store_from]``. Fixed float64 operation order → bit-reproducible."""
+    s, a = target.shape
+    padded = np.empty(s + 1, dtype=np.float64)  # preallocated work buffers
+    padded[s] = _BIG
+    total = np.empty((s, a), dtype=np.float64)
+    flat = total.reshape(-1)
+    row_base = np.arange(s) * a
+    store_to = store_from + (len(store) if store is not None else 0)
+    for t in range(t_hi - 1, t_lo - 1, -1):
+        if checkpoints is not None and (t + 1) % every == 0 and t + 1 != t_hi:
+            checkpoints[t + 1] = v  # V_{t+1}: start of a recomputable segment
+        padded[:s] = v
+        np.take(padded, target, out=total)
+        total += costs[t]
+        best = total.argmin(axis=1)  # first minimum = smallest action on ties
+        if store_from <= t < store_to:
+            store[t - store_from] = best
+        v = flat.take(row_base + best)
+        if tick is not None and t % 512 == 0:
+            tick(t)
+    return v
+
+
 def solve(
     b: Battery,
     buy: np.ndarray,
@@ -131,41 +190,63 @@ def solve(
     float64 and in a fixed order, so the result does not depend on the thread / process it
     runs in.
     """
-    buy = np.asarray(buy, dtype=np.float64)
-    sell = np.asarray(sell, dtype=np.float64)
-    levels, k0, deltas = _grid(b)
-    s = len(levels)
-    if terminal.mode == "value":
-        v = -levels * terminal.czk_per_kwh_stored
-    elif terminal.mode == "min-soc":
-        v = np.maximum(0.0, terminal.min_kwh - levels - 1e-9) * _SHORTFALL_PENALTY
-    else:
-        v = np.zeros(s)
-    a = len(deltas)
-    target = np.arange(s)[:, None] + deltas[None, :]  # transition table (state, action)
-    valid = (target >= 0) & (target < s)
-    target = np.where(valid, target, s)  # index s = padded infeasible state
-    costs = action_costs(b, buy, sell, deltas)
+    buy, sell, levels, k0, deltas, v, target, costs = _setup(b, buy, sell, terminal)
     n = len(buy)
     keep = n if keep is None else max(0, min(keep, n))
-    choice = np.empty((keep, s), dtype=np.int16 if a < 32000 else np.int32)
-    # preallocated work buffers: no per-step allocation
-    padded = np.empty(s + 1, dtype=np.float64)
-    padded[s] = _BIG
-    total = np.empty((s, a), dtype=np.float64)
-    flat = total.reshape(-1)
-    row_base = np.arange(s) * a
-    for t in range(n - 1, -1, -1):
-        padded[:s] = v
-        np.take(padded, target, out=total)
-        total += costs[t]
-        best = total.argmin(axis=1)  # first minimum = smallest action on ties
-        if t < keep:
-            choice[t] = best
-        v = flat.take(row_base + best)
-        if progress is not None and t % 512 == 0:
-            progress((n - t) / n)
+    choice = np.empty((keep, len(levels)), dtype=_choice_dtype(len(deltas)))
+    tick = None if progress is None else (lambda t: progress((n - t) / n))
+    v = _backward(v, target, costs, n, 0, choice, 0, tick)
     return Solution(b, levels, deltas, choice, v, buy, sell, k0)
+
+
+#: decision-table entries kept in memory at once (int8 → bytes); above this the
+#: perfect-foresight rollout recomputes segments from stored value-function checkpoints
+MAX_TABLE_ENTRIES = 64_000_000
+
+
+def solve_rollout(
+    b: Battery,
+    buy: np.ndarray,
+    sell: np.ndarray,
+    terminal: Terminal,
+    soc_kwh: float,
+    progress: Callable[[float], None] | None = None,
+    max_entries: int | None = None,
+) -> list[Step]:
+    """``rollout(solve(...), soc_kwh)`` with bounded memory – bit-identical results.
+
+    Long horizons on big batteries would need a huge decision table (14 700 quarters ×
+    3 600 states for 5 months of a 175 kWh battery). Instead the value function is saved
+    every ``C`` intervals during the backward pass, and the forward pass recomputes each
+    segment's decisions from its checkpoint (same operations, same numbers): ≈ 2× the DP
+    work, a fraction of the memory.
+    """
+    limit = MAX_TABLE_ENTRIES if max_entries is None else max_entries
+    buy, sell, levels, k0, deltas, v_end, target, costs = _setup(b, buy, sell, terminal)
+    n, s = len(buy), len(levels)
+    if n * s <= limit:
+        return rollout(solve(b, buy, sell, terminal, progress), soc_kwh)
+    seg = max(1, min(n, limit // (2 * s)))
+    checkpoints: dict[int, np.ndarray] = {n: v_end}
+    tick1 = None if progress is None else (lambda t: progress((n - t) / n / 2))
+    _backward(v_end, target, costs, n, 0, tick=tick1, checkpoints=checkpoints, every=seg)
+    sol = Solution(b, levels, deltas, np.empty((0, s), np.int8), np.empty(0), buy, sell, k0)
+    state = sol.state_index(soc_kwh)
+    bounds = sorted(checkpoints)  # segment ends: seg, 2·seg, …, n
+    steps: list[Step] = []
+    lo = 0
+    table = np.empty((seg, s), dtype=_choice_dtype(len(deltas)))
+    for hi in bounds:
+        _backward(checkpoints[hi], target, costs, hi, lo, table, lo)
+        part = Solution(b, levels, deltas, table[: hi - lo], np.empty(0), buy[lo:hi],
+                        sell[lo:hi], k0)  # fmt: skip
+        for t in range(hi - lo):
+            st, state = step_at(part, t, state)
+            steps.append(replace(st, index=lo + t))
+        if progress is not None:
+            progress(0.5 + hi / n / 2)
+        lo = hi
+    return steps
 
 
 def solve_choice(

@@ -15,7 +15,7 @@ soc_max = 100                # %
 # terminal = "value"         # value | zero | min-soc
 # terminal_price_czk_kwh = 3.5
 # terminal_soc = 50
-# soc_step_kwh = 0.025
+# soc_step_kwh = 0.02        # default: a fraction of a full-power quarter, ≤ capacity / 400
 
 [buy]                        # purchase: spot × multiplier + add_czk_mwh
 multiplier = 1.0

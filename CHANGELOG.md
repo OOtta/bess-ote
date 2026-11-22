@@ -52,5 +52,19 @@ First version of **bess-ote** (BESS OTE kalkulačka).
     `--no-foresight` 4.13 s → 0.54 s.
   - Progress bar fraction = DP work done (rolling solves and the benchmark weighted by
     quarter-hours), correct for serial and parallel runs.
+- Fix: profit could fall with growing battery capacity. The SoC grid step was capacity / 400
+  regardless of power, so full power was rounded down to whole steps – at 175 kWh / 5 kW the
+  step was 0.4375 kWh and charging ran at 3.7 kW (100 kWh: 4.2 kW, 125 kWh: 3.95 kW).
+  New default step: a fraction of one full-power quarter-hour, or capacity / 400, whichever is
+  lower (`charge_q / (K × 2^j)`, K ≥ 9 from power and efficiencies so full-power charging –
+  and with the default 90 % round trip also discharging – is exact; nested grids so a bigger
+  battery can do everything a smaller one can); grid anchored at min SoC. Perfect-foresight
+  profit is now monotone in capacity (tests over a dense capacity sweep, and within 0.5 % of
+  the continuous LP optimum – scipy as a test-only dependency). Live June–October 2026,
+  10 kWh / 5 kW: trading profit 3,319.54 → 3,326.27 CZK (exact 5 kW instead of 4.95/4.93 kW);
+  175 kWh: perfect foresight 5,713.86 → 6,732.01 CZK. Slower for small batteries (finer
+  grid; 10 kWh `--jobs auto` 1.25 s → 2.36 s), `--soc-step` overrides. Long perfect-foresight
+  runs on big batteries keep value-function checkpoints instead of the full decision table
+  (bit-identical, bounded memory); decision tables are int8 when possible.
 - Czech README explains the negative-price modes for purchase and sale
   (`--buy-negative`, `--sell-negative`) with example tables.

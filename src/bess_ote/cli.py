@@ -159,7 +159,8 @@ def common_parser() -> argparse.ArgumentParser:
         "--soc-step",
         type=float,
         metavar="KWH",
-        help="optimiser SoC resolution (default capacity/400)",
+        help="optimiser SoC resolution (default: full-power quarter / K, at most capacity/400 "
+        "– full power stays exact)",
     )
 
     t = p.add_argument_group("purchase tariff (nákup): spot × multiplier + add")

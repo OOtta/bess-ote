@@ -29,6 +29,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
   - [Záporné ceny (`--buy-negative`, `--sell-negative`)](#záporné-ceny---buy-negative---sell-negative)
   - [Měsíční poplatky](#měsíční-poplatky)
 - [Algoritmus](#algoritmus)
+  - [Mřížka SoC a plný výkon](#mřížka-soc-a-plný-výkon)
   - [Rychlost a paralelní výpočet (`--jobs`)](#rychlost-a-paralelní-výpočet---jobs)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
 - [Výstupy](#výstupy)
@@ -100,21 +101,21 @@ Sell:         spot − 300 CZK/MWh, excl. VAT
 Distribution: VT 2.435 / NT 0.416 CZK/kWh (NT 01:15–05:15, 12:30–16:30; Sat/Sun 02:45–06:45, 13:00–17:00; holidays as weekend) (on purchase only)
 Prices:       prices for day D known on D−1 at 12:57 (delivery ≤ 2025-09-30) / 13:05 (from 2025-10-01), used from the next quarter-hour; 154 re-optimisations
 
-Bought             1314.45 kWh   cost          3195.02 CZK
-Sold               1183.01 kWh   revenue       6514.56 CZK
-Trading profit                           3319.54 CZK (21.70 CZK/day, before monthly fees)
+Bought             1314.93 kWh   cost          3197.08 CZK
+Sold               1183.44 kWh   revenue       6523.35 CZK
+Trading profit                           3326.27 CZK (21.74 CZK/day, before monthly fees)
 Monthly fees                            -2444.20 CZK (supplier 147 + distribution 257 CZK/month + VAT 21 % = 488.84 CZK/month, prorated by days)
-NET PROFIT                                875.34 CZK (5.72 CZK/day)
+NET PROFIT                                882.07 CZK (5.77 CZK/day)
 Cycles               138.6 (equivalent full cycles of usable capacity)
-SoC           10.0 % → 10.0 % (stored energy change worth 0.00 CZK; trading profit incl. it 3319.54 CZK)
-Perfect foresight (all prices known in advance): trading profit 3327.94 CZK incl. stored energy, 138.7 cycles; rolling plan captures 99.7 %
+SoC           10.0 % → 10.0 % (stored energy change worth 0.00 CZK; trading profit incl. it 3326.27 CZK)
+Perfect foresight (all prices known in advance): trading profit 3334.61 CZK incl. stored energy, 138.7 cycles; rolling plan captures 99.7 %
 
 month       bought kWh       cost   sold kWh    revenue     profit      fees        net  cycles
-2026-06         244.87     418.94     220.38    1213.29     794.34    488.84     305.50    25.8
-2026-07         279.10     474.66     251.19    1050.17     575.51    488.84      86.67    29.4
-2026-08         248.82     570.89     222.80    1174.41     603.52    488.84     114.68    26.1
-2026-09         326.22     914.59     294.73    1834.02     919.44    488.84     430.60    34.5
-2026-10         215.46     815.94     193.91    1242.67     426.73    488.84     -62.11    22.7
+2026-06         244.76     418.48     220.28    1214.13     795.66    488.84     306.82    25.8
+2026-07         278.92     474.15     251.03    1050.26     576.10    488.84      87.26    29.4
+2026-08         248.89     571.09     222.97    1176.30     605.21    488.84     116.37    26.1
+2026-09         326.25     914.60     294.66    1835.78     921.18    488.84     432.34    34.5
+2026-10         216.11     818.77     194.50    1246.89     428.12    488.84     -60.72    22.8
 ```
 
 Výstup programu je v angličtině (čísla s desetinnou tečkou, snadno se dále zpracují),
@@ -145,7 +146,7 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `--terminal value\|zero\|min-soc` | co s energií, která zbude na konci známých cen – viz [Algoritmus](#algoritmus) | `value` |
 | `--terminal-price KČ_KWH` | prodejní cena zbylé energie pro `value` | průměrná výkupní cena posledního známého dne |
 | `--terminal-soc PCT` | minimální SoC na konci pro `min-soc` | = `--soc` |
-| `--soc-step KWH` | jemnost mřížky SoC optimalizátoru | kapacita / 400 |
+| `--soc-step KWH` | jemnost mřížky SoC optimalizátoru, viz [Mřížka SoC](#mřížka-soc-a-plný-výkon) | zlomek čtvrthodiny na plný výkon, nejvýš kapacita / 400 |
 
 **Nákup (spot × násobek + přirážka)**
 
@@ -332,7 +333,7 @@ faktury za odběr). Příklad: `--buy-monthly-fee 147 --distribution-monthly-fee
 ## Algoritmus
 
 Optimalizace je **dynamické programování** přes jemnou mřížku uložené energie (výchozí krok
-kapacita/400, tj. 0,025 kWh u 10 kWh baterie):
+viz [Mřížka SoC](#mřížka-soc-a-plný-výkon), např. 0,0165 kWh u 10 kWh / 5 kW baterie):
 
 - stav = energie v baterii, akce v každé čtvrthodině = jedna změna energie (nabíjet X kW,
   vybíjet X kW, nebo čekat) – **současné nabíjení a vybíjení je vyloučeno**;
@@ -351,8 +352,61 @@ Výsledek je **přesné optimum na dané mřížce** (testy ho ověřují proti 
 posloupností akcí). Proč ne lineární programování: LP by vyžadovalo scipy (velká závislost,
 v Termuxu problematická) a vyloučení současného nabíjení a vybíjení by z něj udělalo úlohu
 s celočíselnými proměnnými. DP v numpy spočítá den a půl (≈140 čtvrthodin) za několik
-milisekund. Jediná daň za mřížku: maximální výkon se zaokrouhlí dolů na celý krok mřížky
-(u 5 kW baterie např. 4,95 kW místo 5 kW, tj. < 1 %); jemnější krok nastavíte `--soc-step`.
+milisekund.
+
+### Mřížka SoC a plný výkon
+
+Optimalizátor pracuje s energií v násobcích kroku mřížky, takže i změna energie za jednu
+čtvrthodinu musí být celý počet kroků. Výchozí krok je **zlomek energie, kterou baterie uloží
+za čtvrthodinu na plný výkon, nebo kapacita / 400 – podle toho, co je menší**:
+
+```text
+krok = (P_nab × 0,25 h × η_nab) / (K × 2^j)
+```
+
+- `K` závisí jen na výkonu a účinnostech: nejmenší K ≥ 9, pro které je celým počtem kroků
+  i **plné vybíjení** (při výchozí účinnosti 90 % tam a zpět vyjde K = 9: plné nabití = 9
+  kroků, plné vybití = 10 kroků, obojí přesně); jinak takové, které ztratí nejvýš 0,5 %
+  výkonu vybíjení;
+- `2^j` je nejmenší mocnina dvou, se kterou je krok ≤ kapacita / 400 (jemné rozlišení SoC
+  u malých baterií);
+- mřížka začíná přesně na minimálním SoC.
+
+Plné nabíjení je tak **vždy přesně zadaný výkon** a mřížky jsou do sebe vnořené: krok větší
+baterie dělí krok menší baterie, takže větší baterie má k dispozici každý rozvrh menší
+baterie a **zisk při dokonalé znalosti cen s kapacitou nikdy neklesá** (ověřují testy na
+hustém rozsahu kapacit, stejně tak blízkost k optimu lineárního programu – rozdíl do 0,5 %,
+u větších baterií prakticky nulový).
+
+*Proč ta změna (verze 0.1.0 před opravou):* krok býval kapacita / 400 bez ohledu na výkon.
+U velkých baterií pak plný výkon nebyl celým počtem kroků a zaokrouhlil se dolů – u 175 kWh /
+5 kW byl krok 0,4375 kWh, nabíjení 2 kroky = 0,875 kWh místo 1,186 kWh, tedy **3,7 kW místo
+5 kW** (u 100 kWh 4,2 kW, u 125 kWh 3,95 kW). Zisk proto s rostoucí kapacitou nepravidelně
+klesal. Backtest červen–říjen 2026 (5 kW, ostatní parametry z příkladu výše):
+
+| Kapacita | ideál před | ideál po | klouzavý plán před | klouzavý plán po |
+|---:|---:|---:|---:|---:|
+| 10 kWh (2×) | 3 327,94 | 3 334,61 | 3 319,54 | 3 326,27 |
+| 25 kWh (5×) | 5 117,76 | 5 260,47 | 5 059,43 | 5 207,76 |
+| 50 kWh (10×) | 5 575,47 | 5 836,54 | 5 125,64 | 5 402,90 |
+| 75 kWh (15×) | 5 979,55 | 6 150,00 | 5 236,82 | 5 402,90 |
+| 100 kWh (20×) | 5 712,49 | 6 368,87 | 4 792,78 | 5 402,90 |
+| 125 kWh (25×) | 5 643,60 | 6 517,04 | 4 615,92 | 5 402,90 |
+| 150 kWh (30×) | 6 082,82 | 6 633,08 | 4 895,77 | 5 402,90 |
+| 175 kWh (35×) | 5 713,86 | 6 732,01 | 4 521,71 | 5 402,90 |
+
+(Kč za obchodování, ideál včetně hodnoty energie v baterii na konci.) Klouzavý plán od
+~45 kWh dál neroste: plánuje nanejvýš den a půl dopředu a zbylou energii oceňuje průměrnou
+cenou posledního známého dne, takže 5 kW baterie nikdy nepotřebuje uložit víc než ~45 kWh –
+větší kapacita zůstane nevyužitá, ale zisk nesníží. Ideál zná celé období dopředu a velkou
+kapacitu využije k přesunu energie mezi dny.
+
+Daň za přesnost je rychlost: jemnější mřížka znamená víc stavů a akcí. U 10 kWh / 5 kW je
+práce na krok ≈ 2,6× větší než dřív (608 stavů × 153 akcí); u velkých baterií se krok drží
+na 1/9 plného výkonu (175 kWh: 1 329 stavů × 20 akcí). Hrubší a rychlejší mřížku lze zvolit
+ručně `--soc-step`. U velmi dlouhých období s velkou baterií ideál nedrží celou tabulku
+rozhodnutí v paměti, ale ukládá jen funkci hodnoty po úsecích a rozhodnutí úseku dopočítá
+(stejná čísla, ≈ 2× víc výpočtu, zlomek paměti).
 
 ### Rychlost a paralelní výpočet (`--jobs`)
 
@@ -385,12 +439,15 @@ a smyčka DP používá předem alokované pole (float64, bez alokací v každé
 Měření (backtest červen–říjen 2026 z příkladu výše, ceny v mezipaměti, 8 jader, celý běh
 programu včetně startu Pythonu):
 
-| | před (0.1.0 bez optimalizací) | `--jobs 1` | `--jobs 4` | `--jobs auto` (8) |
+| | `--jobs 1` | `--jobs 2` | `--jobs 4` | `--jobs auto` (8) |
 |---|---:|---:|---:|---:|
-| backtest se srovnáním s ideálem | 5,18 s | 2,45 s | 1,23 s | 1,25 s |
-| backtest `--no-foresight` | 4,13 s | 1,59 s | 0,69 s | 0,54 s |
+| backtest se srovnáním s ideálem | 5,30 s | 3,47 s | 2,48 s | 2,36 s |
+| backtest `--no-foresight` | 3,34 s | 1,89 s | 1,12 s | 0,76 s |
 
-Se srovnáním s ideálem je nejdelší jednotlivou úlohou samotný výpočet ideálu (≈ 0,85 s,
+(S jemnější mřížkou SoC – viz [Mřížka SoC](#mřížka-soc-a-plný-výkon). Před optimalizacemi a se
+starou hrubší mřížkou trval tentýž backtest 5,18 s / 4,13 s.)
+
+Se srovnáním s ideálem je nejdelší jednotlivou úlohou samotný výpočet ideálu (≈ 2 s,
 zpětný průchod přes celé období je ze své podstaty sekvenční), proto víc než ~4 procesy už
 nepomůžou; bez něj backtest škáluje dál.
 

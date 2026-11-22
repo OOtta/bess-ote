@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 
 DT_H = 0.25  # decision interval: one quarter-hour
 
@@ -22,7 +23,7 @@ class Battery:
       (round trip = product).
     * ``soc_min_pct`` / ``soc_max_pct`` – allowed state of charge.
     * ``cycle_cost_czk_kwh`` – wear cost per kWh delivered to the grid (default 0).
-    * ``soc_step_kwh`` – resolution of the optimiser's SoC grid (default capacity / 400).
+    * ``soc_step_kwh`` – resolution of the optimiser's SoC grid (default: see :func:`auto_step`).
     """
 
     capacity_kwh: float
@@ -60,8 +61,20 @@ class Battery:
         return self.charge_eff * self.discharge_eff
 
     @property
+    def charge_q_kwh(self) -> float:
+        """Stored energy gained in one quarter-hour at full charging power."""
+        return self.charge_kw * DT_H * self.charge_eff
+
+    @property
+    def discharge_q_kwh(self) -> float:
+        """Stored energy spent in one quarter-hour at full discharging power."""
+        return self.p_dis * DT_H / self.discharge_eff
+
+    @property
     def step(self) -> float:
-        return self.soc_step_kwh or self.capacity_kwh / 400
+        if self.soc_step_kwh:
+            return self.soc_step_kwh
+        return auto_step(self.capacity_kwh, self.charge_q_kwh, self.discharge_q_kwh)
 
     @property
     def e_min(self) -> float:
@@ -88,3 +101,53 @@ class Battery:
         if self.cycle_cost_czk_kwh:
             text += f", wear {self.cycle_cost_czk_kwh:g} CZK/kWh discharged"
         return text
+
+
+#: full-power quarter-hour = at least this many grid steps. 9 makes both directions exact for
+#: the default round trip of 90 % (discharge quantum = 10/9 × charge quantum); a finer
+#: minimum gave the same profit in tests against the LP optimum, only slower (work ∝ K²)
+MIN_STEPS_PER_QUARTER = 9
+#: … and the step never exceeds capacity / this (fine SoC resolution for small batteries)
+CAPACITY_DIVISOR = 400
+#: accepted loss of full discharge power from rounding it down to whole steps
+MAX_DISCHARGE_LOSS = 0.005
+
+
+@lru_cache(maxsize=256)
+def base_steps(charge_q: float, discharge_q: float) -> int:
+    """Steps per full-power charging quarter for a power-limited grid (depends on power and
+    efficiency only): the first K ≥ :data:`MIN_STEPS_PER_QUARTER` with full-power
+    discharging also a whole number of steps, else the first losing ≤ 0.5 % of its power."""
+    ks = range(MIN_STEPS_PER_QUARTER, 8 * MIN_STEPS_PER_QUARTER + 1)
+    ratio = discharge_q / charge_q
+
+    def loss(k: int) -> float:
+        r = ratio * k
+        return (r - math.floor(r + 1e-9)) / r if r >= 1 else 1.0
+
+    for k in ks:
+        if loss(k) <= 1e-6:
+            return k
+    for k in ks:
+        if loss(k) <= MAX_DISCHARGE_LOSS:
+            return k
+    return min(ks, key=loss)
+
+
+@lru_cache(maxsize=256)
+def auto_step(capacity_kwh: float, charge_q: float, discharge_q: float) -> float:
+    """Default SoC grid step: a fraction of the stored energy of one full-power quarter-hour,
+    or capacity / 400, whichever is lower.
+
+    ``step = charge_q / (K × 2^j)`` with K = :func:`base_steps` and the smallest j that keeps
+    the step ≤ capacity / 400. Full-power charging is a whole number of steps (never rounded
+    down; previously the step was capacity / 400 and 5 kW became 3.7 kW at 175 kWh), and so is
+    discharging for the default efficiencies. The grids are nested: a bigger battery's step
+    divides a smaller one's, so every schedule of a smaller battery is also available to a
+    bigger one and the optimum cannot fall with capacity.
+    """
+    k = base_steps(charge_q, discharge_q)
+    m = 1
+    while charge_q / (k * m) > capacity_kwh / CAPACITY_DIVISOR * (1 + 1e-12):
+        m *= 2
+    return charge_q / (k * m)
