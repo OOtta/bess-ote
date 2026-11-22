@@ -722,8 +722,10 @@ def plan_quarters(res: PlanResult, tariffs: Tariffs) -> list[Quarter]:
     out, soc = [], res.soc_kwh
     p = res.problem
     for t, spot, buy, sell, st in zip(p.starts, p.spot, p.buy, p.sell, res.steps, strict=True):
+        dist = tariffs.buy_distribution_czk_kwh(t, QUARTER)
         out.append(Quarter(t, float(spot), float(buy), float(sell), st, soc,
-                           tariffs.fees_for_quarter(t)))  # fmt: skip
+                           tariffs.fees_for_quarter(t), dist,
+                           tariffs.low_tariff_fraction(t, QUARTER)))  # fmt: skip
         soc = st.soc_kwh
     return out
 
@@ -732,10 +734,10 @@ def render_fine(rows: list[dict[str, Any]], by: str, fees: bool) -> None:
     """Text table of hour / quarter-hour rows (times local, with CET/CEST)."""
     extra = f" {'fees':>8} {'net':>9}" if fees else ""
     head = "acts" if by == "hour" else ""
-    print(f"{by:<21} {head:<4} {'action':<17} {'spot':>8} {'buy':>7} {'sell':>7} {'bought':>8} "
-          f"{'sold':>8} {'SoC %':>6} {'profit':>9}{extra}")  # fmt: skip
-    print(f"{'(local)':<21} {'':<4} {'':<17} {'CZK/MWh':>8} {'CZK/kWh':>7} {'CZK/kWh':>7} "
-          f"{'kWh':>8} {'kWh':>8} {'end':>6} {'CZK':>9}")  # fmt: skip
+    print(f"{by:<21} {head:<4} {'action':<17} {'spot':>8} {'buy':>7} {'dist':>7} {'':<5} "
+          f"{'sell':>7} {'bought':>8} {'sold':>8} {'SoC %':>6} {'profit':>9}{extra}")  # fmt: skip
+    print(f"{'(local)':<21} {'':<4} {'':<17} {'CZK/MWh':>8} {'CZK/kWh':>7} {'in buy':>7} "
+          f"{'':<5} {'CZK/kWh':>7} {'kWh':>8} {'kWh':>8} {'end':>6} {'CZK':>9}")  # fmt: skip
 
     def num(v: float | None, spec: str) -> str:
         return "–" if v is None else format(v, spec)
@@ -745,7 +747,8 @@ def render_fine(rows: list[dict[str, Any]], by: str, fees: bool) -> None:
         pat = r["pattern"] if by == "hour" else ""
         extra = f" {r['fees_czk']:>8.3f} {r['net_profit_czk']:>9.3f}" if fees else ""
         print(f"{fmt_local(t):<21} {pat:<4} {r['action']:<17} {num(r['spot_czk_mwh'], '.2f'):>8} "
-              f"{num(r['buy_czk_kwh'], '.3f'):>7} {num(r['sell_czk_kwh'], '.3f'):>7} "
+              f"{num(r['buy_czk_kwh'], '.3f'):>7} {num(r['dist_czk_kwh'], '.3f'):>7} "
+              f"{r['tariff']:<5} {num(r['sell_czk_kwh'], '.3f'):>7} "
               f"{r['bought_kwh']:>8.3f} {r['sold_kwh']:>8.3f} {r['soc_end_pct']:>6.1f} "
               f"{r['profit_czk']:>9.3f}{extra}")  # fmt: skip
 

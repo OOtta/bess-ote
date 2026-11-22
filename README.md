@@ -511,7 +511,10 @@ zónou), `quarters` (počet čtvrthodin v řádku), `action` (`charge` / `discha
 u hodiny se smíšenými akcemi podle čistého toku energie, `mixed (…)` při nabíjení i vybíjení
 v téže hodině, `no price` = čtvrthodiny bez ceny OTE), `pattern` (průběh hodiny po
 čtvrthodinách: `C` nabíjení, `D` vybíjení, `-` čekání, `.` bez ceny), průměrné ceny
-`spot_czk_mwh`, `buy_czk_kwh`, `sell_czk_kwh`, `power_kw` (průměrný čistý výkon), `grid_kwh`,
+`spot_czk_mwh`, `buy_czk_kwh`, `dist_czk_kwh` (distribuce + ostatní položky za kWh **vč. DPH
+nákupu** – část nákupní ceny, která nezávisí na spotu; v textu sloupec `dist`), `tariff`
+(`NT`, `VT`, u hodiny přes hranici pásma `VT/NT`; prázdné bez zadaných hodin NT),
+`sell_czk_kwh`, `power_kw` (průměrný čistý výkon), `grid_kwh`,
 `soc_start_pct`, `soc_end_pct` a součty `bought_kwh`, `cost_czk`, `sold_kwh`, `revenue_czk`,
 `wear_czk`, `profit_czk`, `fees_czk`, `net_profit_czk`.
 
@@ -524,6 +527,25 @@ v téže hodině, `no price` = čtvrthodiny bez ceny OTE), `pattern` (průběh h
 - **Přechod času:** hodina = čtvrthodiny jedné hodiny UTC, takže v den přechodu na zimní čas
   je 25 řádků (02:00 CEST a 02:00 CET zvlášť, 100 čtvrthodin) a na letní čas 23 řádků (92
   čtvrthodin).
+- **Nákupní cena skáče na hranicích NT.** `buy` = (spot × koeficient + přirážka) / 1000 ×
+  (1 + DPH) + `dist`, takže na začátku a konci okna NT se změní o (VT − NT) × (1 + DPH), tady
+  (2,435 − 0,416) × 1,21 = 2,443 Kč/kWh, i když se spot skoro nehne. Prodejní cena distribuci
+  neobsahuje, proto spot sleduje plynule. Příklad 6. 5. 2026 (středa, NT 1:15–5:15 a
+  12:30–16:30 místního času):
+
+  ```text
+  quarter-hour               action                spot     buy    dist          sell   bought     sold  SoC %    profit
+  (local)                                       CZK/MWh CZK/kWh  in buy       CZK/kWh      kWh      kWh    end       CZK
+  2026-05-06 01:00 CEST      wait               2821.49   6.844   2.946 VT      2.522    0.000    0.000   10.0     0.000
+  2026-05-06 01:15 CEST      wait               2729.97   4.291   0.503 NT      2.430    0.000    0.000   10.0     0.000
+  2026-05-06 12:15 CEST      wait               2090.81   5.960   2.946 VT      1.791    0.000    0.000   10.0     0.000
+  2026-05-06 12:30 CEST      wait               1909.96   3.298   0.503 NT      1.610    0.000    0.000   10.0     0.000
+  2026-05-06 12:45 CEST      charge             1728.38   3.079   0.503 NT      1.428    1.250    0.000   21.9    -3.848
+  ```
+
+  12:15 (VT): 2090,81 / 1000 = 2,091 + 0,400 přirážka = 2,491 Kč/kWh × 1,21 = 3,014 + dist
+  2,435 × 1,21 = 2,946 → **5,960**; 12:30 (NT): (1,910 + 0,400) × 1,21 = 2,795 + 0,416 × 1,21
+  = 0,503 → **3,298**. Optimalizace počítá se stejnými cenami, takže nabíjí v levném NT.
 - Čtvrthodiny, kdy backtest neznal ceny, zůstanou jako řádky `no price` – kvůli měsíčním
   poplatkům a souvislé řadě SoC.
 
@@ -531,33 +553,33 @@ Ukázka (skutečné ceny OTE, 14. 10. 2026, 10 kWh / 5 kW, parametry z rychlého
 měsíčních poplatků), výřez hodinového rozpisu:
 
 ```text
-hour                  acts action                spot     buy    sell   bought     sold  SoC %    profit
-(local)                                       CZK/MWh CZK/kWh CZK/kWh      kWh      kWh    end       CZK
-2026-10-14 16:00 CEST ---- wait               3654.65   6.631   3.355    0.000    0.000   99.9     0.000
-2026-10-14 17:00 CEST ---- wait               5499.18  10.084   5.199    0.000    0.000   99.9     0.000
-2026-10-14 18:00 CEST ---D discharge          6620.78  11.441   6.321    0.000    1.250   86.8     8.862
-2026-10-14 19:00 CEST DDDD discharge          7198.73  12.141   6.899    0.000    5.000   34.0    34.494
-2026-10-14 20:00 CEST DD-- discharge          6576.03  11.387   6.276    0.000    2.281   10.0    15.219
-2026-10-14 21:00 CEST ---- wait               5837.77  10.494   5.538    0.000    0.000   10.0     0.000
+hour                  acts action                spot     buy    dist          sell   bought     sold  SoC %    profit
+(local)                                       CZK/MWh CZK/kWh  in buy       CZK/kWh      kWh      kWh    end       CZK
+2026-10-14 16:00 CEST ---- wait               3654.65   6.631   1.725 VT/NT   3.355    0.000    0.000   99.9     0.000
+2026-10-14 17:00 CEST ---- wait               5499.18  10.084   2.946 VT      5.199    0.000    0.000   99.9     0.000
+2026-10-14 18:00 CEST ---D discharge          6620.78  11.441   2.946 VT      6.321    0.000    1.250   86.8     8.862
+2026-10-14 19:00 CEST DDDD discharge          7198.73  12.141   2.946 VT      6.899    0.000    5.000   34.0    34.494
+2026-10-14 20:00 CEST DD-- discharge          6576.03  11.387   2.946 VT      6.276    0.000    2.281   10.0    15.219
+2026-10-14 21:00 CEST ---- wait               5837.77  10.494   2.946 VT      5.538    0.000    0.000   10.0     0.000
 ```
 
 a čtvrthodinového rozpisu kolem večerní špičky:
 
 ```text
-quarter-hour               action                spot     buy    sell   bought     sold  SoC %    profit
-(local)                                       CZK/MWh CZK/kWh CZK/kWh      kWh      kWh    end       CZK
-2026-10-14 18:00 CEST      wait               6088.75  10.798   5.789    0.000    0.000   99.9     0.000
-2026-10-14 18:15 CEST      wait               6297.96  11.051   5.998    0.000    0.000   99.9     0.000
-2026-10-14 18:30 CEST      wait               6706.64  11.545   6.407    0.000    0.000   99.9     0.000
-2026-10-14 18:45 CEST      discharge          7389.79  12.372   7.090    0.000    1.250   86.8     8.862
-2026-10-14 19:00 CEST      discharge          6997.68  11.898   6.698    0.000    1.250   73.6     8.372
-2026-10-14 19:15 CEST      discharge          7232.95  12.182   6.933    0.000    1.250   60.4     8.666
-2026-10-14 19:30 CEST      discharge          7282.15  12.242   6.982    0.000    1.250   47.2     8.728
-2026-10-14 19:45 CEST      discharge          7282.15  12.242   6.982    0.000    1.250   34.0     8.728
-2026-10-14 20:00 CEST      discharge          7111.17  12.035   6.811    0.000    1.250   20.9     8.514
-2026-10-14 20:15 CEST      discharge          6801.38  11.660   6.501    0.000    1.031   10.0     6.705
-2026-10-14 20:30 CEST      wait               6306.00  11.061   6.006    0.000    0.000   10.0     0.000
-2026-10-14 20:45 CEST      wait               6085.58  10.794   5.786    0.000    0.000   10.0     0.000
+quarter-hour               action                spot     buy    dist          sell   bought     sold  SoC %    profit
+(local)                                       CZK/MWh CZK/kWh  in buy       CZK/kWh      kWh      kWh    end       CZK
+2026-10-14 18:00 CEST      wait               6088.75  10.798   2.946 VT      5.789    0.000    0.000   99.9     0.000
+2026-10-14 18:15 CEST      wait               6297.96  11.051   2.946 VT      5.998    0.000    0.000   99.9     0.000
+2026-10-14 18:30 CEST      wait               6706.64  11.545   2.946 VT      6.407    0.000    0.000   99.9     0.000
+2026-10-14 18:45 CEST      discharge          7389.79  12.372   2.946 VT      7.090    0.000    1.250   86.8     8.862
+2026-10-14 19:00 CEST      discharge          6997.68  11.898   2.946 VT      6.698    0.000    1.250   73.6     8.372
+2026-10-14 19:15 CEST      discharge          7232.95  12.182   2.946 VT      6.933    0.000    1.250   60.4     8.666
+2026-10-14 19:30 CEST      discharge          7282.15  12.242   2.946 VT      6.982    0.000    1.250   47.2     8.728
+2026-10-14 19:45 CEST      discharge          7282.15  12.242   2.946 VT      6.982    0.000    1.250   34.0     8.728
+2026-10-14 20:00 CEST      discharge          7111.17  12.035   2.946 VT      6.811    0.000    1.250   20.9     8.514
+2026-10-14 20:15 CEST      discharge          6801.38  11.660   2.946 VT      6.501    0.000    1.031   10.0     6.705
+2026-10-14 20:30 CEST      wait               6306.00  11.061   2.946 VT      6.006    0.000    0.000   10.0     0.000
+2026-10-14 20:45 CEST      wait               6085.58  10.794   2.946 VT      5.786    0.000    0.000   10.0     0.000
 ```
 
 ## Konfigurační soubor

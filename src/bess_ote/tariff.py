@@ -132,6 +132,18 @@ class Tariffs:
         n = (local_midnight_utc(d + timedelta(days=1)) - local_midnight_utc(d)) // QUARTER
         return self.fees_for_day(d) / n
 
+    def buy_distribution_czk_kwh(self, start_utc: datetime, length: timedelta) -> float:
+        """Distribution (VT/NT) + other per-kWh items incl. purchase VAT – the part of
+        :meth:`buy_czk_kwh` that does not follow the spot price."""
+        return self.distribution.czk_kwh(start_utc, length) * (1 + self.buy_vat_percent / 100)
+
+    def low_tariff_fraction(self, start_utc: datetime, length: timedelta) -> float | None:
+        """Share of the interval in NT (None = no VT/NT schedule)."""
+        d = self.distribution
+        if d.schedule is None or d.low_czk_kwh is None:
+            return None
+        return d.schedule.low_fraction(start_utc, length)
+
     def buy_czk_kwh(self, spot_czk_mwh: float, start_utc: datetime, length: timedelta) -> float:
         """Price of 1 kWh taken from the grid: (energy + distribution + other) × (1 + VAT)."""
         net = self.buy.czk_mwh(spot_czk_mwh) / 1000 + self.distribution.czk_kwh(start_utc, length)

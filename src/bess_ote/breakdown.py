@@ -55,6 +55,10 @@ class Quarter:
     step: Step | None
     soc_before_kwh: float
     fee_czk: float = 0.0
+    #: distribution + other per-kWh items incl. purchase VAT (part of ``buy_czk_kwh``)
+    dist_czk_kwh: float = math.nan
+    #: share of the quarter in NT; None = no VT/NT schedule
+    low_tariff: float | None = None
 
 
 def _mean(values: list[float]) -> float | None:
@@ -64,6 +68,17 @@ def _mean(values: list[float]) -> float | None:
 
 def _round(v: float | None, nd: int) -> float | None:
     return None if v is None else round(v, nd)
+
+
+def _tariff_label(qs: list[Quarter]) -> str:
+    fr = [q.low_tariff for q in qs if q.low_tariff is not None]
+    if not fr:
+        return ""
+    if all(f >= 1 for f in fr):
+        return "NT"
+    if all(f <= 0 for f in fr):
+        return "VT"
+    return "VT/NT"
 
 
 def fine_rows(quarters: Iterable[Quarter], battery: Battery, by: str) -> list[dict]:
@@ -103,6 +118,11 @@ def fine_rows(quarters: Iterable[Quarter], battery: Battery, by: str) -> list[di
             "spot_czk_mwh": _round(_mean([q.spot_czk_mwh for q in qs]), 2),
             "buy_czk_kwh": _round(_mean([q.buy_czk_kwh for q in qs]), 4),
             "sell_czk_kwh": _round(_mean([q.sell_czk_kwh for q in qs]), 4),
+            # buy = (energy + distribution) × (1 + VAT); dist = the distribution part incl. VAT
+            "dist_czk_kwh": _round(
+                _mean([q.dist_czk_kwh for q in qs if not math.isnan(q.buy_czk_kwh)]), 4
+            ),
+            "tariff": _tariff_label(qs),  # NT / VT / VT/NT (mixed hour), "" = no schedule
             "power_kw": round(abs(grid) / hours, 3) if hours else 0.0,  # average net grid
             "grid_kwh": round(grid, ND),
             "soc_start_pct": round(battery.pct(qs[0].soc_before_kwh), 2),

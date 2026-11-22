@@ -120,16 +120,23 @@ class BacktestResult:
     def quarters(self) -> list[Quarter]:
         """Every quarter-hour of the period, skipped ones (no price) as idle quarters."""
         by_start = {iv.start: iv for iv in self.intervals}
-        fee = self.tariffs.fees_for_quarter if self.tariffs is not None else (lambda t: 0.0)
+        tf = self.tariffs
+
+        def extra(t: datetime) -> tuple[float, float, float | None]:
+            if tf is None:
+                return 0.0, math.nan, None
+            return (tf.fees_for_quarter(t), tf.buy_distribution_czk_kwh(t, QUARTER),
+                    tf.low_tariff_fraction(t, QUARTER))  # fmt: skip
+
         out, soc = [], self.initial_soc_kwh
         t, t_end = local_midnight_utc(self.start), local_midnight_utc(self.end + timedelta(days=1))
         while t < t_end:
             iv = by_start.get(t)
             if iv is None:
-                out.append(Quarter(t, math.nan, math.nan, math.nan, None, soc, fee(t)))
+                out.append(Quarter(t, math.nan, math.nan, math.nan, None, soc, *extra(t)))
             else:
                 out.append(Quarter(t, iv.spot_czk_mwh, iv.buy_czk_kwh, iv.sell_czk_kwh, iv.step,
-                                   soc, fee(t)))  # fmt: skip
+                                   soc, *extra(t)))  # fmt: skip
                 soc = iv.step.soc_kwh
             t += QUARTER
         return out

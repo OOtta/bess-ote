@@ -66,6 +66,12 @@ First version of **bess-ote** (BESS OTE kalkulačka).
   grid; 10 kWh `--jobs auto` 1.25 s → 2.36 s), `--soc-step` overrides. Long perfect-foresight
   runs on big batteries keep value-function checkpoints instead of the full decision table
   (bit-identical, bounded memory); decision tables are int8 when possible.
+- Breakdown rows show the distribution part of the purchase price: `dist_czk_kwh` (VT/NT
+  distribution + other per-kWh items incl. purchase VAT; text column `dist`) and `tariff`
+  (`NT` / `VT` / `VT/NT`), so the step of the buy price at the NT window edges
+  ((VT − NT) × (1 + VAT)) is visible. Regression test recomputes every quarter's buy price by
+  hand (ČNB rate, negative-price surcharge, VT/NT by local time incl. a holiday, VAT). Prices
+  and decisions are unchanged.
 - Hour and quarter-hour breakdowns: `backtest -b hour|quarter-hour` (aliases `h`, `60min`,
   `qh`, `15min`, `quarter`; also `d` for day) and `plan -b hour|quarter-hour`; rows with local
   time, actions (`pattern` per quarter: C/D/-/.), average prices, energy, SoC, cost, revenue,

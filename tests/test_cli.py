@@ -387,3 +387,48 @@ def test_example_config_is_valid():
 
     cfg = load_config(Path(__file__).parents[1] / "examples" / "config.example.toml")
     assert cfg.warnings == [] and cfg.get("battery", "capacity_kwh") == 10
+
+
+def neg_price(d, i):
+    """EUR/MWh with negative midday prices (15-minute era)."""
+    return round(90 * math.cos(i / 96 * 2 * math.pi) + 10 + d.day, 2)
+
+
+def test_buy_price_hand_computed_with_vt_nt_holiday_and_negative(mocked, capsys):
+    """Regression for the 'buy price does not follow spot' report: every quarter's buy price
+    is recomputed by hand – EUR × ČNB rate of the day (28 Oct holiday has no fixing → 27 Oct
+    rate), buy formula incl. the negative-price surcharge, VT/NT by the local (CEST/CET)
+    wall clock with the holiday on the weekend windows, VAT on energy + distribution."""
+    add_ote(mocked, FakeOte(neg_price))
+    add_cnb(mocked)
+    rate = {27: 24.325, 28: 24.325, 29: 24.335}
+    wd, we = [(75, 315), (750, 990)], [(165, 405), (780, 1020)]
+    argv = ["backtest", *BAT, "-m", "1.1", "-a", "400", "--buy-negative-add", "100",
+            "--buy-vat", "21", "--sell-add", "-300", "--distribution-high", "2.435",
+            "--distribution-low", "0.416", "--low-tariff-hours", "1:15-5:15,12:30-16:30",
+            "--low-tariff-hours-weekend", "2:45-6:45,13:00-17:00", "--holidays", "weekend",
+            "--from", "2025-10-27", "--to", "2025-10-29", "-b", "qh", "--json"]  # fmt: skip
+    rows = json.loads(run(argv, capsys)[1])["breakdown"]["rows"]
+    assert len(rows) == 3 * 96
+    negatives = charged = 0
+    for k, r in enumerate(rows):
+        day, i = 27 + k // 96, k % 96
+        assert r["period"][:16] == f"2025-10-{day}T{i // 4:02d}:{i % 4 * 15:02d}"
+        spot = neg_price(date(2025, 10, day), i + 1) * rate[day]
+        energy = spot * 1.1 + (400 if spot >= 0 else 100)
+        nt = any(a <= i * 15 < b for a, b in (we if day == 28 else wd))
+        dist = (0.416 if nt else 2.435) * 1.21
+        buy = (energy / 1000) * 1.21 + dist
+        assert r["spot_czk_mwh"] == pytest.approx(spot, abs=0.006)
+        assert r["buy_czk_kwh"] == pytest.approx(buy, abs=6e-5), r["period"]
+        assert r["sell_czk_kwh"] == pytest.approx((spot - 300) / 1000, abs=6e-5)
+        assert r["dist_czk_kwh"] == pytest.approx(dist, abs=6e-5)
+        assert r["tariff"] == ("NT" if nt else "VT")
+        negatives += spot < 0
+        if r["bought_kwh"] > 0:  # the price the simulation (and optimizer) actually paid
+            charged += 1
+            assert r["cost_czk"] / r["bought_kwh"] == pytest.approx(buy, abs=1e-4)
+    assert negatives > 20 and charged > 0
+    hours = json.loads(run([*argv[:-2], "h", "--json"], capsys)[1])["breakdown"]["rows"]
+    assert [h["tariff"] for h in hours[12:14]] == ["VT/NT", "NT"]  # 12:30 weekday NT start
+    assert [h["tariff"] for h in hours[24 + 12 : 24 + 14]] == ["VT", "NT"]  # holiday: 13:00
