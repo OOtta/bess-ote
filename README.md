@@ -27,6 +27,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
 - [Příkazy a volby](#příkazy-a-volby)
 - [Jak se počítá cena](#jak-se-počítá-cena)
   - [Záporné ceny (`--buy-negative`, `--sell-negative`)](#záporné-ceny---buy-negative---sell-negative)
+  - [Měsíční poplatky](#měsíční-poplatky)
 - [Algoritmus](#algoritmus)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
 - [Výstupy](#výstupy)
@@ -72,9 +73,9 @@ bess-ote plan -c 10 -p 5 --soc 40 \
 # Jak by plán vypadal v daný okamžik (jen s cenami zveřejněnými do té doby)
 bess-ote plan -c 10 -p 5 --soc 30 --at "2026-11-21 13:20" -o plan.csv
 
-# Backtest za červen–říjen 2026 se stejnými tarify, rozpis po měsících
+# Backtest za červen–říjen 2026 se stejnými tarify a měsíčními poplatky, rozpis po měsících
 bess-ote backtest -c 10 -p 5 --soc-min 10 --from 2026-06 --to 2026-10 \
-  -a 400 --buy-vat 21 --sell-add -300 \
+  -a 400 --buy-vat 21 --sell-add -300 --buy-monthly-fee 147 --distribution-monthly-fee 257 \
   --distribution-high 2.435 --distribution-low 0.416 \
   --low-tariff-hours "1:15-5:15,12:30-16:30" \
   --low-tariff-hours-weekend "2:45-6:45,13:00-17:00" --holidays weekend
@@ -87,7 +88,8 @@ Plan as of 2026-11-22 11:07 CET: 2026-11-22 11:15 CET – 2026-11-23 00:00 CET (
 NEXT 11:15–11:30  WAIT, SoC 50.0 % → 50.0 %
 ```
 
-Ukázka výstupu `backtest` (skutečné ceny OTE, parametry viz poslední příklad výše):
+Ukázka výstupu `backtest` (skutečné ceny OTE, parametry viz poslední příklad výše, s měsíčními
+poplatky 147 + 257 Kč bez DPH):
 
 ```text
 Backtest 2026-06-01 – 2026-10-31 (153 days)
@@ -99,10 +101,19 @@ Prices:       prices for day D known on D−1 at 12:57 (delivery ≤ 2025-09-30)
 
 Bought             1314.45 kWh   cost          3195.02 CZK
 Sold               1183.01 kWh   revenue       6514.56 CZK
-PROFIT                                   3319.54 CZK (21.70 CZK/day)
+Trading profit                           3319.54 CZK (21.70 CZK/day, before monthly fees)
+Monthly fees                            -2444.20 CZK (supplier 147 + distribution 257 CZK/month + VAT 21 % = 488.84 CZK/month, prorated by days)
+NET PROFIT                                875.34 CZK (5.72 CZK/day)
 Cycles               138.6 (equivalent full cycles of usable capacity)
-SoC           10.0 % → 10.0 % (stored energy change worth 0.00 CZK; profit incl. it 3319.54 CZK)
-Perfect foresight (all prices known in advance): profit 3327.94 CZK incl. stored energy, 138.7 cycles; rolling plan captures 99.7 %
+SoC           10.0 % → 10.0 % (stored energy change worth 0.00 CZK; trading profit incl. it 3319.54 CZK)
+Perfect foresight (all prices known in advance): trading profit 3327.94 CZK incl. stored energy, 138.7 cycles; rolling plan captures 99.7 %
+
+month       bought kWh       cost   sold kWh    revenue     profit      fees        net  cycles
+2026-06         244.87     418.94     220.38    1213.29     794.34    488.84     305.50    25.8
+2026-07         279.10     474.66     251.19    1050.17     575.51    488.84      86.67    29.4
+2026-08         248.82     570.89     222.80    1174.41     603.52    488.84     114.68    26.1
+2026-09         326.22     914.59     294.73    1834.02     919.44    488.84     430.60    34.5
+2026-10         215.46     815.94     193.91    1242.67     426.73    488.84     -62.11    22.7
 ```
 
 Výstup programu je v angličtině (čísla s desetinnou tečkou, snadno se dále zpracují),
@@ -143,7 +154,8 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `-a`, `--buy-add KČ_MWH` | přirážka dodavatele | 0 |
 | `--buy-negative-multiplier X`, `--buy-negative-add KČ_MWH` | jiný vzorec pro záporné spotové ceny | = normální |
 | `--buy-negative as-is\|clamp-spot\|clamp-total` | zacházení se zápornými cenami, viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative) | `as-is` |
-| `--buy-vat PCT` | DPH na nákup (energie + distribuce + poplatky) | 0 |
+| `--buy-vat PCT` | DPH na nákup (energie + distribuce + poplatky, včetně měsíčních) | 0 |
+| `--buy-monthly-fee KČ` | stálá měsíční platba dodavateli bez DPH, viz [Měsíční poplatky](#měsíční-poplatky) | 0 |
 
 **Výkup (spot × násobek + přirážka)**
 
@@ -154,12 +166,13 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `--sell-negative-multiplier`, `--sell-negative-add`, `--sell-negative` | jako u nákupu, viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative) | = normální |
 | `--sell-vat PCT` | DPH přičtená k tržbě (jen plátci DPH) | 0 |
 
-**Distribuce a poplatky (jen na nakoupenou energii)**
+**Distribuce a poplatky (sazby za kWh jen na nakoupenou energii)**
 
 | Volba | Význam | Výchozí |
 |---|---|---|
 | `--distribution-high KČ_KWH` | distribuce ve VT (nebo jediná sazba), bez DPH | 0 |
 | `--distribution-low KČ_KWH` | distribuce v NT, bez DPH (vyžaduje časy NT) | – |
+| `--distribution-monthly-fee KČ` | stálé měsíční platby za distribuci bez DPH (jistič / rezervovaný příkon …), viz [Měsíční poplatky](#měsíční-poplatky) | 0 |
 | `--purchase-fee KČ_KWH` | další poplatky za kWh bez DPH (systémové služby, POZE, daň z elektřiny …) | 0 |
 | `--low-tariff-hours "1:15-5:15,12:30-16:30"` | časy NT v pracovní dny (mohou přes půlnoc) | – |
 | `--low-tariff-hours-weekend "…"` | časy NT o víkendu | = pracovní dny |
@@ -189,7 +202,22 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `--from DATUM`, `--to DATUM` | období (`RRRR-MM-DD` nebo `RRRR-MM` = celý měsíc), nejpozději do včerejška |
 | `-b month\|day\|none` | rozpis (výchozí po měsících) |
 | `--no-foresight` | nepočítat srovnání s dokonalou znalostí budoucnosti |
+| `--no-progress` | nezobrazovat průběh výpočtu (viz níže) |
 | `-o FILE` | všechny čtvrthodiny do `.csv`, nebo vše (souhrn, rozpis, čtvrthodiny) do `.json` |
+
+**Průběh výpočtu.** Backtest delšího období trvá i desítky sekund, proto během výpočtu
+ukazuje na stderr jednoduchý řádek s procenty, počtem zpracovaných dní a odhadem zbývajícího
+času:
+
+```text
+[##########--------------]  41.7 %  64/153 days        ETA 0:12
+```
+
+Řádek se překresluje znakem `\r` (jen ASCII, funguje i ve Windows a Termuxu, bez dalších
+závislostí) a po skončení se smaže. Zobrazí se **jen když je stderr terminál** a není zadáno
+`--json` – při přesměrování do souboru, v rouře nebo cronu se nic nevypisuje. Standardní
+výstup ani soubor z `-o` neovlivní. Vypnout jde volbou `--no-progress`. Se srovnáním
+s ideálem připadá zhruba 60 % pruhu na klouzavou simulaci a 40 % na výpočet ideálu.
 
 ## Jak se počítá cena
 
@@ -204,7 +232,8 @@ výkup  [Kč/kWh] = ( spot × m_v + a_v ) / 1000 × (1 + DPH výkup)
   `--sell-negative` – viz [Záporné ceny](#záporné-ceny---buy-negative---sell-negative).
 - Distribuce se podle časů NT počítá po čtvrthodinách v místním čase (správně i ve dnech
   přechodu na letní/zimní čas); čtvrthodina, která NT protíná jen částí, dostane vážený průměr.
-- **Měsíční paušály** (jistič, poplatek dodavateli) arbitráž neovlivní, proto se nezadávají.
+- **Měsíční paušály** (jistič, poplatek dodavateli) se zadávají zvlášť a rozhodování
+  neovlivní – viz [Měsíční poplatky](#měsíční-poplatky).
 - Ceny OTE: do 30. 9. 2025 hodinové ceny v Kč (každá platí pro 4 čtvrthodiny), od 1. 10. 2025
   čtvrthodinové ceny v EUR přepočtené kurzem ČNB platným pro den dodávky.
 
@@ -268,6 +297,34 @@ neovlivní. Jak to dělá váš dodavatel / výkupce, najdete ve smlouvě nebo v
 u definice ceny pro „hodiny se zápornou cenou“). Stejná pravidla používá
 [egd-api-client](https://github.com/OOtta/egd-api-client).
 
+### Měsíční poplatky
+
+Stálé měsíční platby nezávislé na odebrané energii:
+
+* `--buy-monthly-fee KČ` (v konfiguraci `[buy] monthly_fee`) – stálá platba dodavateli
+  (paušál obchodníka),
+* `--distribution-monthly-fee KČ` (v konfiguraci `[distribution] monthly_fee`) – stálé platby
+  za distribuci (za jistič / rezervovaný příkon, případně další měsíční složky).
+
+Obě částky se zadávají **bez DPH v Kč za měsíc** a obě se řídí **`--buy-vat`** (jsou součástí
+faktury za odběr). Příklad: `--buy-monthly-fee 147 --distribution-monthly-fee 257 --buy-vat 21`
+= (147 + 257) × 1,21 = **488,84 Kč/měsíc**.
+
+* **Rozhodování neovlivní.** Jsou to fixní náklady – platíte je stejně, ať baterie nabíjí,
+  vybíjí, nebo stojí – takže optimalizátor dává s poplatky i bez nich přesně stejný rozvrh
+  (ověřuje test). Slouží k tomu, abyste viděli čistý výsledek.
+* **Rozpočítání po dnech.** Každý den nese `poplatek / počet dní daného měsíce` (v červnu
+  1/30, v červenci 1/31, …); neúplný měsíc se tedy počítá poměrně podle dní (např. 25.–30. 6.
+  = 6/30 měsíčního poplatku). Den se dál rovnoměrně dělí na čtvrthodiny (sloupec `fees_czk`
+  v CSV; ve dnech změny času 92 / 100 čtvrthodin). Poplatek se počítá za **všechny dny
+  období**, i za dny bez cen OTE.
+* **Backtest** vypíše *Trading profit* (zisk z obchodování před poplatky), *Monthly fees*
+  a *NET PROFIT* (čistý zisk po poplatcích); rozpis po měsících/dnech má sloupce `fees`
+  a `net`, JSON pole `fees_czk`, `net_profit_czk` a `net_profit_per_day_czk`. Srovnání
+  s ideálem se dělá na zisku z obchodování (poplatky jsou v obou případech stejné).
+* **Plán** připočte poplatek poměrně za délku horizontu (např. od 12:00 do půlnoci = půl dne)
+  a vypíše čistý výsledek; v JSON jako `summary.fees_czk` a `summary.net_profit_czk`.
+
 ## Algoritmus
 
 Optimalizace je **dynamické programování** přes jemnou mřížku uložené energie (výchozí krok
@@ -327,7 +384,8 @@ cen. Oba výsledky se porovnávají včetně změny hodnoty energie v baterii (o
   `{"error": "…", "warnings": […]}` (návratový kód 2).
 - **`-o soubor.csv`** – jedna řádka na čtvrthodinu: `start, spot_czk_mwh, buy_czk_kwh,
   sell_czk_kwh, action, power_kw, grid_kwh` (+ nákup, − prodej), `soc_start_pct, soc_end_pct,
-  cash_czk` (+ u backtestu `known_until` = konec cen známých v tu chvíli).
+  cash_czk, fees_czk` (podíl měsíčních poplatků na čtvrthodinu) (+ u backtestu `known_until` =
+  konec cen známých v tu chvíli).
 - **`-o soubor.json`** – totéž co `--json` včetně všech čtvrthodin.
 
 ## Konfigurační soubor
@@ -346,6 +404,7 @@ soc_min = 10
 [buy]
 add_czk_mwh = 400
 vat = 21
+monthly_fee = 147     # Kč/měsíc bez DPH
 
 [sell]
 add_czk_mwh = -300
@@ -353,6 +412,7 @@ add_czk_mwh = -300
 [distribution]
 high_czk_kwh = 2.435
 low_czk_kwh = 0.416
+monthly_fee = 257     # Kč/měsíc bez DPH (jistič …)
 
 [low_tariff]
 hours = "1:15-5:15,12:30-16:30"

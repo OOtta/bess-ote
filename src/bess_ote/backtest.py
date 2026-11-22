@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
@@ -45,6 +46,7 @@ class Totals:
     wear_czk: float = 0.0
     discharged_kwh: float = 0.0  # from storage (before discharge losses)
     intervals: int = 0
+    fees_czk: float = 0.0  # prorated monthly fees (incl. VAT)
 
     def add(self, iv: Interval) -> None:
         st = iv.step
@@ -60,7 +62,12 @@ class Totals:
 
     @property
     def profit_czk(self) -> float:
+        """Trading profit (before monthly fees)."""
         return self.revenue_czk - self.cost_czk - self.wear_czk
+
+    @property
+    def net_profit_czk(self) -> float:
+        return self.profit_czk - self.fees_czk
 
     def as_dict(self, usable_kwh: float) -> dict[str, float]:
         return {
@@ -70,6 +77,8 @@ class Totals:
             "revenue_czk": round(self.revenue_czk, 2),
             "wear_czk": round(self.wear_czk, 2),
             "profit_czk": round(self.profit_czk, 2),
+            "fees_czk": round(self.fees_czk, 2),
+            "net_profit_czk": round(self.net_profit_czk, 2),
             "cycles": round(self.discharged_kwh / usable_kwh, 3) if usable_kwh else 0.0,
         }
 
@@ -89,13 +98,18 @@ class BacktestResult:
     terminal_value_czk_kwh: float = 0.0
     skipped_intervals: int = 0
     warnings: list[str] = field(default_factory=list)
+    fees_by_day: dict[date, float] = field(default_factory=dict)
 
     def breakdown(self, by: str) -> list[dict]:
         groups: dict[str, Totals] = defaultdict(Totals)
+
+        def key(d: date) -> str:
+            return d.isoformat() if by == "day" else f"{d.year:04d}-{d.month:02d}"
+
         for iv in self.intervals:
-            d = to_local(iv.start).date()
-            key = d.isoformat() if by == "day" else f"{d.year:04d}-{d.month:02d}"
-            groups[key].add(iv)
+            groups[key(to_local(iv.start).date())].add(iv)
+        for d, fee in self.fees_by_day.items():
+            groups[key(d)].fees_czk += fee
         return [
             {"period": k} | t.as_dict(self.battery.usable_kwh) for k, t in sorted(groups.items())
         ]
@@ -112,7 +126,9 @@ def run_backtest(
     *,
     publish: time | None = None,
     foresight: bool = True,
+    progress: Callable[[str, float, str], None] | None = None,
 ) -> BacktestResult:
+    """``progress(phase, fraction 0..1, detail)`` is called while simulating."""
     if tcfg.mode == "min-soc" and tcfg.min_soc_pct is None:
         tcfg = TerminalConfig("min-soc", None, battery.pct(initial_soc_kwh))
     t = local_midnight_utc(start)
@@ -127,7 +143,14 @@ def run_backtest(
     skipped = 0
     warnings: list[str] = []
     snapped_initial = None
+    total_q = (t_end - t) / QUARTER
+    n_days = (end - start).days + 1
+    done_q = 0
     while t < t_end:
+        if progress is not None and done_q % 96 == 0:
+            day_no = min(n_days, (to_local(t).date() - start).days)
+            progress("simulate", done_q / total_q, f"{day_no}/{n_days} days")
+        done_q += 1
         horizon = book.horizon(t, t, publish)
         if not horizon:
             skipped += 1
@@ -163,6 +186,13 @@ def run_backtest(
                          solves, skipped_intervals=skipped, warnings=warnings)  # fmt: skip
     if prob is not None:
         res.terminal_value_czk_kwh = prob.terminal.czk_per_kwh_stored
+    d = start
+    while d <= end:
+        res.fees_by_day[d] = tariffs.fees_for_day(d)
+        d += timedelta(days=1)
+    res.totals.fees_czk = sum(res.fees_by_day.values())
+    if progress is not None:
+        progress("simulate", 1.0, f"{n_days}/{n_days} days")
     if foresight and intervals:
         all_starts = [iv.start for iv in intervals]
         if all(b - a == QUARTER for a, b in itertools.pairwise(all_starts)):
@@ -173,11 +203,18 @@ def run_backtest(
             terminal = fprob.terminal
             if terminal.mode == "value":  # same valuation as the report → a true upper bound
                 terminal = Terminal("value", czk_per_kwh_stored=res.terminal_value_czk_kwh)
-            fsol = solve(battery, fprob.buy, fprob.sell, terminal)
+            cb = None
+            if progress is not None:
+
+                def cb(f: float) -> None:
+                    progress("foresight", f, "perfect foresight")
+
+            fsol = solve(battery, fprob.buy, fprob.sell, terminal, cb)
             ft = Totals()
             steps = rollout(fsol, snapped_initial)
             for i, s in enumerate(steps):
                 ft.add(Interval(all_starts[i], math.nan, 0, 0, s, all_starts[-1]))
+            ft.fees_czk = res.totals.fees_czk
             res.foresight = ft
             res.foresight_end_soc_kwh = steps[-1].soc_kwh if steps else snapped_initial
         else:

@@ -19,13 +19,13 @@ KNOWN: dict[str, set[str]] = {
     },
     "buy": {
         "multiplier", "add_czk_mwh", "negative_multiplier", "negative_add_czk_mwh",
-        "negative", "vat",
+        "negative", "vat", "monthly_fee",
     },
     "sell": {
         "multiplier", "add_czk_mwh", "negative_multiplier", "negative_add_czk_mwh",
         "negative", "vat",
     },
-    "distribution": {"high_czk_kwh", "low_czk_kwh", "other_czk_kwh"},
+    "distribution": {"high_czk_kwh", "low_czk_kwh", "other_czk_kwh", "monthly_fee"},
     "low_tariff": {"hours", "hours_weekend", "holidays"},
     "market": {"publish_time"},
 }  # fmt: skip

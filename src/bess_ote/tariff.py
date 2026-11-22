@@ -8,10 +8,11 @@ printed with every result.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from bess_ote.lowtariff import LowTariffSchedule
+from bess_ote.timeutil import QUARTER, days_in_month, local_date, local_midnight_utc
 
 NegativeMode = Literal["as-is", "clamp-spot", "clamp-total"]
 
@@ -109,6 +110,27 @@ class Tariffs:
     distribution: Distribution = Distribution()
     buy_vat_percent: float = 0.0
     sell_vat_percent: float = 0.0
+    #: fixed CZK/month excl. VAT (supplier fee, distribution: breaker / capacity); both follow
+    #: the purchase VAT. They do not change any decision, only the reported net result.
+    buy_monthly_fee: float = 0.0
+    distribution_monthly_fee: float = 0.0
+
+    @property
+    def monthly_fees(self) -> float:
+        """Monthly fees per month incl. purchase VAT."""
+        return (self.buy_monthly_fee + self.distribution_monthly_fee) * (
+            1 + self.buy_vat_percent / 100
+        )
+
+    def fees_for_day(self, d: date) -> float:
+        """Monthly fees prorated to one local day (incl. VAT): fee / days of that month."""
+        return self.monthly_fees / days_in_month(d.year, d.month)
+
+    def fees_for_quarter(self, start_utc: datetime) -> float:
+        """Day share spread evenly over the day's quarter-hours (92/96/100 on DST days)."""
+        d = local_date(start_utc)
+        n = (local_midnight_utc(d + timedelta(days=1)) - local_midnight_utc(d)) // QUARTER
+        return self.fees_for_day(d) / n
 
     def buy_czk_kwh(self, spot_czk_mwh: float, start_utc: datetime, length: timedelta) -> float:
         """Price of 1 kWh taken from the grid: (energy + distribution + other) × (1 + VAT)."""
@@ -126,4 +148,16 @@ class Tariffs:
             "buy": self.buy.describe() + vat_b,
             "sell": self.sell.describe() + vat_s,
             "distribution": self.distribution.describe() + (" (on purchase only)"),
-        }
+        } | ({"monthly_fees": self.describe_fees()} if self.monthly_fees else {})
+
+    def describe_fees(self) -> str:
+        parts = []
+        if self.buy_monthly_fee:
+            parts.append(f"supplier {self.buy_monthly_fee:g}")
+        if self.distribution_monthly_fee:
+            parts.append(f"distribution {self.distribution_monthly_fee:g}")
+        vat = f" + VAT {self.buy_vat_percent:g} %" if self.buy_vat_percent else ""
+        return (
+            f"{' + '.join(parts)} CZK/month{vat} = {self.monthly_fees:.2f} CZK/month "
+            "(prorated by days; do not affect decisions)"
+        )

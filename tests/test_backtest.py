@@ -3,6 +3,7 @@
 import random
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
+from itertools import pairwise
 
 import pytest
 
@@ -90,3 +91,44 @@ def test_hourly_era_and_gaps():
     assert res.skipped_intervals == 96  # 30 Sep unknown → idle
     assert any("skipped" in w for w in res.warnings)
     assert res.foresight is None
+
+
+def test_monthly_fees_prorated_by_days_and_do_not_change_decisions():
+    book = synthetic_book(date(2026, 6, 25), 10)
+    vat = replace(T, buy_vat_percent=21)
+    fees = replace(vat, buy_monthly_fee=147, distribution_monthly_fee=257)
+    tv = TerminalConfig()
+    plain = run_backtest(book, date(2026, 6, 25), date(2026, 7, 3), vat, B, tv, 1.0)
+    res = run_backtest(book, date(2026, 6, 25), date(2026, 7, 3), fees, B, tv, 1.0)
+    # fixed costs: identical decisions, trading profit unchanged
+    assert [iv.step for iv in res.intervals] == [iv.step for iv in plain.intervals]
+    assert res.totals.profit_czk == pytest.approx(plain.totals.profit_czk)
+    monthly = 404 * 1.21
+    june, july = monthly * 6 / 30, monthly * 3 / 31  # 25–30 June, 1–3 July
+    assert res.totals.fees_czk == pytest.approx(june + july)
+    assert res.totals.net_profit_czk == pytest.approx(res.totals.profit_czk - june - july)
+    assert plain.totals.fees_czk == 0
+    rows = res.breakdown("month")
+    assert [r["period"] for r in rows] == ["2026-06", "2026-07"]
+    assert rows[0]["fees_czk"] == pytest.approx(june, abs=0.01)
+    assert rows[1]["fees_czk"] == pytest.approx(july, abs=0.01)
+    for r in rows:
+        assert r["net_profit_czk"] == pytest.approx(r["profit_czk"] - r["fees_czk"], abs=0.02)
+    days = res.breakdown("day")
+    assert sum(r["fees_czk"] for r in days) == pytest.approx(june + july, abs=0.05)
+    # per-quarter share sums to the day share (incl. a 92-quarter DST day)
+    d = date(2026, 3, 29)
+    q = [local_midnight_utc(d) + i * QUARTER for i in range(92)]
+    assert sum(fees.fees_for_quarter(t) for t in q) == pytest.approx(fees.fees_for_day(d))
+    assert fees.fees_for_day(d) == pytest.approx(monthly / 31)
+
+
+def test_progress_callback_reaches_100_percent():
+    book = synthetic_book(date(2026, 6, 1), 4)
+    seen = []
+    run_backtest(book, date(2026, 6, 1), date(2026, 6, 3), T, B, TerminalConfig(), 1.0,
+                 progress=lambda ph, f, det: seen.append((ph, f, det)))  # fmt: skip
+    sim = [s for s in seen if s[0] == "simulate"]
+    assert sim[0][1] == 0 and sim[-1][1] == 1.0 and sim[-1][2] == "3/3 days"
+    assert all(a[1] <= b[1] for a, b in pairwise(sim))
+    assert any(s[0] == "foresight" for s in seen)

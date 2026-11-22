@@ -20,6 +20,7 @@ fresh ``plan`` at that moment would give (asserted by the tests).
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -115,7 +116,13 @@ def action_costs(b: Battery, buy: np.ndarray, sell: np.ndarray, deltas: np.ndarr
     return np.where(np.isnan(cost), _BIG, cost)
 
 
-def solve(b: Battery, buy: np.ndarray, sell: np.ndarray, terminal: Terminal) -> Solution:
+def solve(
+    b: Battery,
+    buy: np.ndarray,
+    sell: np.ndarray,
+    terminal: Terminal,
+    progress: Callable[[float], None] | None = None,
+) -> Solution:
     """Backward DP over the whole horizon (``buy``/``sell`` in CZK/kWh per quarter-hour)."""
     buy = np.asarray(buy, dtype=float)
     sell = np.asarray(sell, dtype=float)
@@ -140,6 +147,8 @@ def solve(b: Battery, buy: np.ndarray, sell: np.ndarray, terminal: Terminal) -> 
         best = np.argmin(total, axis=1)
         choice[t] = best
         v = total[rows, best]
+        if progress is not None and t % 512 == 0:
+            progress((n - t) / n)
     return Solution(b, levels, deltas, choice, v, buy, sell, k0)
 
 

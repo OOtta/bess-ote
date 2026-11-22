@@ -23,7 +23,8 @@ add_czk_mwh = 400
 # negative_multiplier = 1.0
 # negative_add_czk_mwh = 0
 # negative = "as-is"         # as-is | clamp-spot | clamp-total
-vat = 21                     # % on energy + distribution + fees
+vat = 21                     # % on energy + distribution + fees (incl. monthly fees)
+# monthly_fee = 147          # supplier's fixed fee CZK/month excl. VAT (prorated by days)
 
 [sell]                       # sale: spot × multiplier + add_czk_mwh
 multiplier = 1.0
@@ -34,6 +35,7 @@ add_czk_mwh = -300           # supplier fee
 high_czk_kwh = 2.435
 low_czk_kwh = 0.416
 # other_czk_kwh = 0.6        # system services, POZE, electricity tax …
+# monthly_fee = 257          # fixed distribution payments CZK/month excl. VAT (breaker …)
 
 [low_tariff]
 hours = "1:15-5:15,12:30-16:30"

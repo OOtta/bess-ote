@@ -10,6 +10,7 @@ import math
 import sys
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from bess_ote import __version__
@@ -173,7 +174,15 @@ def common_parser() -> argparse.ArgumentParser:
         "--buy-vat",
         type=float,
         metavar="PCT",
-        help="VAT %% on purchase incl. distribution (default 0 = prices excl. VAT)",
+        help="VAT %% on purchase incl. distribution and monthly fees (default 0 = prices "
+        "excl. VAT)",
+    )
+    t.add_argument(
+        "--buy-monthly-fee",
+        type=float,
+        metavar="CZK",
+        help="supplier's fixed fee CZK/month excl. VAT (prorated by days; does not change "
+        "decisions), default 0",
     )
 
     s = p.add_argument_group("sale tariff (výkup): spot × multiplier + add")
@@ -194,7 +203,7 @@ def common_parser() -> argparse.ArgumentParser:
         help="VAT %% added to sale revenue (VAT payers; default 0)",
     )
 
-    d = p.add_argument_group("distribution (charged on purchased energy only)")
+    d = p.add_argument_group("distribution (per-kWh rates charged on purchased energy only)")
     d.add_argument(
         "--distribution-high",
         type=float,
@@ -206,6 +215,13 @@ def common_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="CZK_KWH",
         help="NT rate excl. VAT (needs --low-tariff-hours)",
+    )
+    d.add_argument(
+        "--distribution-monthly-fee",
+        type=float,
+        metavar="CZK",
+        help="fixed distribution payments CZK/month excl. VAT (breaker, reserved capacity; "
+        "prorated by days, follows --buy-vat), default 0",
     )
     d.add_argument(
         "--purchase-fee",
@@ -302,6 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("-b", "--breakdown", choices=["month", "day", "none"], default="month")
     bt.add_argument(
         "--no-foresight", action="store_true", help="skip the perfect-foresight benchmark"
+    )
+    bt.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="no progress bar (shown only on a terminal and without --json)",
     )
     bt.add_argument(
         "-o", "--export", metavar="FILE", help="intervals as .csv, or everything as .json"
@@ -430,6 +451,13 @@ def build_tariffs(args: argparse.Namespace, cfg: Config) -> Tariffs:
         distribution=dist,
         buy_vat_percent=_num(_pick(args, "buy_vat", cfg, "buy", "vat", 0.0), "buy VAT"),
         sell_vat_percent=_num(_pick(args, "sell_vat", cfg, "sell", "vat", 0.0), "sell VAT"),
+        buy_monthly_fee=_num(
+            _pick(args, "buy_monthly_fee", cfg, "buy", "monthly_fee", 0.0), "buy monthly fee"
+        ),
+        distribution_monthly_fee=_num(
+            _pick(args, "distribution_monthly_fee", cfg, "distribution", "monthly_fee", 0.0),
+            "distribution monthly fee",
+        ),
     )
 
 
@@ -504,7 +532,7 @@ def _r(v: float, nd: int = 4) -> float | None:
 # ------------------------------------------------------------------------------------------
 # plan
 # ------------------------------------------------------------------------------------------
-def plan_rows(res: PlanResult, b: Battery) -> list[dict[str, Any]]:
+def plan_rows(res: PlanResult, b: Battery, tariffs: Tariffs) -> list[dict[str, Any]]:
     rows = []
     prev = res.soc_kwh
     for t, spot, buy, sell, st in zip(res.problem.starts, res.problem.spot, res.problem.buy,
@@ -520,12 +548,13 @@ def plan_rows(res: PlanResult, b: Battery) -> list[dict[str, Any]]:
             "soc_start_pct": round(b.pct(prev), 2),
             "soc_end_pct": round(b.pct(st.soc_kwh), 2),
             "cash_czk": round(st.cash_czk - st.wear_czk, 4),
+            "fees_czk": round(tariffs.fees_for_quarter(t), 4),
         })  # fmt: skip
         prev = st.soc_kwh
     return rows
 
 
-def _summary(steps: list, b: Battery) -> dict[str, float]:
+def _summary(steps: list, fees: float) -> dict[str, float]:
     bought = sum(s.grid_kwh for s in steps if s.grid_kwh > 0)
     sold = -sum(s.grid_kwh for s in steps if s.grid_kwh < 0)
     cost = -sum(s.cash_czk for s in steps if s.grid_kwh > 0)
@@ -535,6 +564,7 @@ def _summary(steps: list, b: Battery) -> dict[str, float]:
         "bought_kwh": round(bought, 4), "cost_czk": round(cost, 2),
         "sold_kwh": round(sold, 4), "revenue_czk": round(rev, 2),
         "wear_czk": round(wear, 2), "profit_czk": round(rev - cost - wear, 2),
+        "fees_czk": round(fees, 2), "net_profit_czk": round(rev - cost - wear - fees, 2),
     }  # fmt: skip
 
 
@@ -569,8 +599,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
         raise CliError(f"No OTE prices known for {fmt_local(start)} (as of {fmt_local(at)}).")
     if abs(res.soc_kwh - soc) > 1e-9:
         info(f"SoC rounded to the optimiser grid: {b.pct(res.soc_kwh):.2f} %")
-    rows = plan_rows(res, b)
-    summary = _summary(res.steps, b)
+    rows = plan_rows(res, b, tariffs)
+    summary = _summary(res.steps, sum(tariffs.fees_for_quarter(t) for t in res.problem.starts))
     end = res.problem.starts[-1] + QUARTER
     term = res.problem.terminal
     doc: dict[str, Any] = {
@@ -623,6 +653,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
           f"CZK, sold {summary['sold_kwh']:.2f} kWh for {summary['revenue_czk']:.2f} CZK, "
           f"wear {summary['wear_czk']:.2f} CZK → profit {summary['profit_czk']:.2f} CZK; "
           f"SoC at the end {rows[-1]['soc_end_pct']:.1f} %")  # fmt: skip
+    if summary["fees_czk"]:
+        print(f"Monthly fees prorated to the horizon: {summary['fees_czk']:.2f} CZK → net "
+              f"{summary['net_profit_czk']:.2f} CZK")  # fmt: skip
     return 0
 
 
@@ -649,7 +682,56 @@ def export_rows(path: Path, rows: list[dict[str, Any]], doc: dict[str, Any]) -> 
 # ------------------------------------------------------------------------------------------
 # backtest
 # ------------------------------------------------------------------------------------------
-def backtest_rows(res: BacktestResult) -> list[dict[str, Any]]:
+class ProgressBar:
+    """Single-line progress on stderr (``\\r`` redraw, ASCII only – safe on Windows/Termux).
+
+    Shown only when stderr is a terminal; stdout and exported files are never touched.
+    Rolling simulation and the perfect-foresight benchmark are weighted 60 / 40.
+    """
+
+    WIDTH = 24
+
+    def __init__(self, stream: Any, foresight_share: float = 0.4) -> None:
+        self.stream = stream
+        self.share = foresight_share
+        self.t0 = monotonic()
+        self.last = 0.0
+        self.shown = False
+
+    @classmethod
+    def create(cls, *, enabled: bool) -> ProgressBar | None:
+        stream = sys.stderr
+        if not enabled or stream is None or not getattr(stream, "isatty", lambda: False)():
+            return None
+        return cls(stream)
+
+    def update(self, phase: str, fraction: float, detail: str) -> None:
+        overall = fraction * (1 - self.share) if phase == "simulate" else (
+            1 - self.share + fraction * self.share
+        )  # fmt: skip
+        now = monotonic()
+        if now - self.last < 0.1 and fraction < 1:
+            return
+        self.last = now
+        elapsed = now - self.t0
+        eta = elapsed / overall * (1 - overall) if overall > 0.02 else None
+        filled = int(self.WIDTH * overall)
+        bar = "#" * filled + "-" * (self.WIDTH - filled)
+        eta_txt = f"ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta is not None else "ETA --:--"
+        line = f"\r[{bar}] {overall * 100:5.1f} %  {detail:<18} {eta_txt}"
+        with contextlib.suppress(OSError, ValueError):
+            self.stream.write(line)
+            self.stream.flush()
+            self.shown = True
+
+    def close(self) -> None:
+        if self.shown:
+            with contextlib.suppress(OSError, ValueError):
+                self.stream.write("\r" + " " * 72 + "\r")
+                self.stream.flush()
+
+
+def backtest_rows(res: BacktestResult, tariffs: Tariffs) -> list[dict[str, Any]]:
     b = res.battery
     rows, prev = [], res.initial_soc_kwh
     for iv in res.intervals:
@@ -665,6 +747,7 @@ def backtest_rows(res: BacktestResult) -> list[dict[str, Any]]:
             "soc_start_pct": round(b.pct(prev), 2),
             "soc_end_pct": round(b.pct(st.soc_kwh), 2),
             "cash_czk": round(st.cash_czk - st.wear_czk, 4),
+            "fees_czk": round(tariffs.fees_for_quarter(iv.start), 4),
             "known_until": to_local(iv.horizon_end).isoformat(),
         })  # fmt: skip
         prev = st.soc_kwh
@@ -691,6 +774,7 @@ def backtest_doc(res: BacktestResult, tariffs: Tariffs, pub: time | None) -> dic
         "soc_end_pct": round(b.pct(res.end_soc_kwh), 2),
         "summary": tot | {
             "profit_per_day_czk": round(tot["profit_czk"] / days, 2),
+            "net_profit_per_day_czk": round(tot["net_profit_czk"] / days, 2),
             "stored_energy_value_change_czk": round(stored_change, 2),
             "profit_incl_stored_energy_czk": round(tot["profit_czk"] + stored_change, 2),
         },
@@ -732,8 +816,14 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     # one extra day: on the last day the next day's prices are published at ~13:05
     book = fetch_book(ote_client(args), start, min(end + timedelta(days=1), today))
     info(f"Simulating {start} – {end} ...")
-    res = run_backtest(book, start, end, tariffs, b, tcfg, soc, publish=pub,
-                       foresight=not args.no_foresight)  # fmt: skip
+    bar = ProgressBar.create(enabled=not (args.json or args.no_progress))
+    try:
+        res = run_backtest(book, start, end, tariffs, b, tcfg, soc, publish=pub,
+                           foresight=not args.no_foresight,
+                           progress=bar.update if bar else None)  # fmt: skip
+    finally:
+        if bar:
+            bar.close()
     for w in res.warnings:
         warn(w)
     if not res.intervals:
@@ -742,7 +832,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if args.breakdown != "none":
         doc["breakdown"] = {"by": args.breakdown, "rows": res.breakdown(args.breakdown)}
     if args.export:
-        rows = backtest_rows(res)
+        rows = backtest_rows(res, tariffs)
         export_rows(Path(args.export), rows, doc | {"intervals": rows})
         info(f"Wrote {args.export}")
     if args.json:
@@ -757,34 +847,52 @@ def render_backtest(doc: dict[str, Any]) -> None:
     print(f"Backtest {p['from']} – {p['to']} ({p['days']} days)")
     print(f"Battery:      {doc['battery']}")
     for k, v in doc["tariffs"].items():
-        print(f"{k.capitalize() + ':':<13} {v}")
+        if k != "monthly_fees":
+            print(f"{k.capitalize() + ':':<13} {v}")
     print(f"Prices:       {doc['publication']}; {doc['optimisations']} re-optimisations")
     print()
     print(f"Bought        {s['bought_kwh']:>12.2f} kWh   cost     {s['cost_czk']:>12.2f} CZK")
     print(f"Sold          {s['sold_kwh']:>12.2f} kWh   revenue  {s['revenue_czk']:>12.2f} CZK")
     if s["wear_czk"]:
         print(f"Wear                                {s['wear_czk']:>12.2f} CZK")
-    print(f"PROFIT                              {s['profit_czk']:>12.2f} CZK "
-          f"({s['profit_per_day_czk']:.2f} CZK/day)")  # fmt: skip
+    if s["fees_czk"]:
+        print(
+            f"Trading profit                      {s['profit_czk']:>12.2f} CZK "
+            f"({s['profit_per_day_czk']:.2f} CZK/day, before monthly fees)"
+        )
+        print(
+            f"Monthly fees                        {-s['fees_czk']:>12.2f} CZK "
+            f"({doc['tariffs']['monthly_fees'].split(' (')[0]}, prorated by days)"
+        )
+        print(
+            f"NET PROFIT                          {s['net_profit_czk']:>12.2f} CZK "
+            f"({s['net_profit_per_day_czk']:.2f} CZK/day)"
+        )
+    else:
+        print(f"PROFIT                              {s['profit_czk']:>12.2f} CZK "
+              f"({s['profit_per_day_czk']:.2f} CZK/day)")  # fmt: skip
     print(f"Cycles        {s['cycles']:>12.1f} (equivalent full cycles of usable capacity)")
     print(f"SoC           {doc['soc_start_pct']:.1f} % → {doc['soc_end_pct']:.1f} %"
           f" (stored energy change worth {s['stored_energy_value_change_czk']:.2f} CZK; "
-          f"profit incl. it {s['profit_incl_stored_energy_czk']:.2f} CZK)")  # fmt: skip
+          f"trading profit incl. it {s['profit_incl_stored_energy_czk']:.2f} CZK)")  # fmt: skip
     f = doc.get("perfect_foresight")
     if f:
         cap = f"{f['captured_pct']:.1f} %" if f["captured_pct"] is not None else "–"
-        print(f"Perfect foresight (all prices known in advance): profit "
+        print(f"Perfect foresight (all prices known in advance): trading profit "
               f"{f['profit_incl_stored_energy_czk']:.2f} CZK incl. stored energy, "
               f"{f['cycles']:.1f} cycles; rolling plan captures {cap}")  # fmt: skip
     br = doc.get("breakdown")
     if br:
         print()
+        fees = bool(s["fees_czk"])
+        extra = f" {'fees':>9} {'net':>10}" if fees else ""
         print(f"{br['by']:<10} {'bought kWh':>11} {'cost':>10} {'sold kWh':>10} "
-              f"{'revenue':>10} {'profit':>10} {'cycles':>7}")  # fmt: skip
+              f"{'revenue':>10} {'profit':>10}{extra} {'cycles':>7}")  # fmt: skip
         for r in br["rows"]:
+            extra = f" {r['fees_czk']:>9.2f} {r['net_profit_czk']:>10.2f}" if fees else ""
             print(f"{r['period']:<10} {r['bought_kwh']:>11.2f} {r['cost_czk']:>10.2f} "
-                  f"{r['sold_kwh']:>10.2f} {r['revenue_czk']:>10.2f} {r['profit_czk']:>10.2f} "
-                  f"{r['cycles']:>7.1f}")  # fmt: skip
+                  f"{r['sold_kwh']:>10.2f} {r['revenue_czk']:>10.2f} {r['profit_czk']:>10.2f}"
+                  f"{extra} {r['cycles']:>7.1f}")  # fmt: skip
 
 
 # ------------------------------------------------------------------------------------------

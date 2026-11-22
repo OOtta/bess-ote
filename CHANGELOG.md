@@ -25,5 +25,14 @@ First version of **bess-ote** (BESS OTE kalkulačka).
 - OTE prices (hourly CZK until 2025-09-30, 15-minute EUR from 2025-10-01 converted with the
   ČNB rate of the delivery day) and ČNB rates with a persistent per-day cache (from
   egd-api-client); TOML config; Windows/Termux-safe output; Python 3.11–3.14.
+- Monthly fees: `--buy-monthly-fee` and `--distribution-monthly-fee` (config `[buy]` /
+  `[distribution]` `monthly_fee`), CZK/month excl. VAT, subject to `--buy-vat`. Fixed costs –
+  decisions are unchanged; prorated per day (fee / days in the month, partial months by days)
+  and spread over the day's quarter-hours. Backtest prints trading profit, monthly fees and net
+  profit, with `fees` / `net` columns in the breakdown and `fees_czk` / `net_profit_czk` in
+  CSV/JSON; `plan` shows the fees for the horizon and the net result.
+- Backtest progress bar on stderr (percent, days processed, ETA; plain `\r`, ASCII, no
+  dependency) – only when stderr is a terminal and without `--json`; `--no-progress` turns it
+  off.
 - Czech README explains the negative-price modes for purchase and sale
   (`--buy-negative`, `--sell-negative`) with example tables.

@@ -99,6 +99,66 @@ def test_backtest_json_and_exports(ote, tmp_path, capsys):
     assert len(json.loads(json_path.read_text(encoding="utf-8"))["intervals"]) == 3 * 96
 
 
+class FakeTty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_monthly_fees_cli_backtest_and_plan(ote, tmp_path, capsys):
+    fees = ["--buy-vat", "21", "--buy-monthly-fee", "147", "--distribution-monthly-fee", "257"]
+    argv = ["backtest", *BAT, *TAR, "--from", "2025-06-29", "--to", "2025-07-02"]
+    rc, out, _ = run([*argv, *fees, "--json"], capsys)
+    doc = json.loads(out)
+    s = doc["summary"]
+    m = 404 * 1.21
+    assert s["fees_czk"] == pytest.approx(m * 2 / 30 + m * 2 / 31, abs=0.01)
+    assert s["net_profit_czk"] == pytest.approx(s["profit_czk"] - s["fees_czk"], abs=0.02)
+    assert "monthly_fees" in doc["tariffs"]
+    rc, plain, _ = run([*argv, "--buy-vat", "21", "--json"], capsys)
+    assert json.loads(plain)["summary"]["profit_czk"] == s["profit_czk"]
+    assert json.loads(plain)["summary"]["fees_czk"] == 0
+    rc, out, _ = run([*argv, *fees, "--no-progress"], capsys)
+    assert "Trading profit" in out and "Monthly fees" in out and "NET PROFIT" in out
+    assert " fees " in out and " net " in out  # month breakdown columns
+    csv_path = tmp_path / "bt.csv"
+    assert main([*argv, *fees, "-o", str(csv_path)]) == 0
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    assert sum(float(r["fees_czk"]) for r in rows) == pytest.approx(s["fees_czk"], abs=0.01)
+    capsys.readouterr()
+    rc, out, _ = run(["plan", *BAT, *TAR, *fees, "--at", "2025-06-10 12:00", "--json"], capsys)
+    assert rc == 0
+    ps = json.loads(out)["summary"]
+    assert ps["fees_czk"] == pytest.approx(m / 30 / 2, abs=0.01)  # 12:00–24:00 = half a day
+    assert ps["net_profit_czk"] == pytest.approx(ps["profit_czk"] - ps["fees_czk"], abs=0.02)
+    _, out, _ = run(["plan", *BAT, *TAR, *fees, "--at", "2025-06-10 12:00"], capsys)
+    assert "Monthly fees prorated to the horizon" in out
+
+
+def test_backtest_progress_bar_only_on_tty(ote, tmp_path, monkeypatch, capsys):
+    argv = ["backtest", *BAT, "--from", "2025-06-01", "--to", "2025-06-02"]
+    main([*argv, "--json"])  # warm the cache
+    capsys.readouterr()
+    tty = FakeTty()
+    monkeypatch.setattr(sys, "stderr", tty)
+    csv_path = tmp_path / "bt.csv"
+    assert main([*argv, "-o", str(csv_path)]) == 0
+    out = capsys.readouterr().out
+    bar = tty.getvalue()
+    assert "\r[" in bar and "100.0 %" in bar and "2/2 days" in bar and "ETA" in bar
+    assert "\r" + " " * 72 + "\rWrote" in bar  # line cleared before further messages
+    assert "\r" not in out and "#" not in out
+    assert "\r" not in csv_path.read_text(encoding="utf-8")
+    for extra in (["--json"], ["--no-progress"]):
+        tty.seek(0)
+        tty.truncate()
+        assert main([*argv, *extra]) == 0
+        assert "\r[" not in tty.getvalue()
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stderr", io.StringIO())  # not a terminal → no bar
+    assert main(argv) == 0
+    assert "\r[" not in sys.stderr.getvalue()
+
+
 def test_backtest_text_15min_era(ote, capsys):
     rc, out, err = run(["backtest", *BAT, "--from", "2025-10-01", "--to", "2025-10-02"], capsys)
     assert rc == 0, err
