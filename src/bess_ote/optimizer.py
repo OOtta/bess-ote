@@ -122,10 +122,17 @@ def solve(
     sell: np.ndarray,
     terminal: Terminal,
     progress: Callable[[float], None] | None = None,
+    keep: int | None = None,
 ) -> Solution:
-    """Backward DP over the whole horizon (``buy``/``sell`` in CZK/kWh per quarter-hour)."""
-    buy = np.asarray(buy, dtype=float)
-    sell = np.asarray(sell, dtype=float)
+    """Backward DP over the whole horizon (``buy``/``sell`` in CZK/kWh per quarter-hour).
+
+    ``keep`` stores the decisions of the first ``keep`` intervals only (the backtest executes
+    just those); the recursion itself always runs over the whole horizon. All arithmetic is
+    float64 and in a fixed order, so the result does not depend on the thread / process it
+    runs in.
+    """
+    buy = np.asarray(buy, dtype=np.float64)
+    sell = np.asarray(sell, dtype=np.float64)
     levels, k0, deltas = _grid(b)
     s = len(levels)
     if terminal.mode == "value":
@@ -134,22 +141,38 @@ def solve(
         v = np.maximum(0.0, terminal.min_kwh - levels - 1e-9) * _SHORTFALL_PENALTY
     else:
         v = np.zeros(s)
-    target = np.arange(s)[:, None] + deltas[None, :]
+    a = len(deltas)
+    target = np.arange(s)[:, None] + deltas[None, :]  # transition table (state, action)
     valid = (target >= 0) & (target < s)
     target = np.where(valid, target, s)  # index s = padded infeasible state
     costs = action_costs(b, buy, sell, deltas)
     n = len(buy)
-    choice = np.empty((n, s), dtype=np.int16 if len(deltas) < 32000 else np.int32)
-    rows = np.arange(s)
+    keep = n if keep is None else max(0, min(keep, n))
+    choice = np.empty((keep, s), dtype=np.int16 if a < 32000 else np.int32)
+    # preallocated work buffers: no per-step allocation
+    padded = np.empty(s + 1, dtype=np.float64)
+    padded[s] = _BIG
+    total = np.empty((s, a), dtype=np.float64)
+    flat = total.reshape(-1)
+    row_base = np.arange(s) * a
     for t in range(n - 1, -1, -1):
-        padded = np.append(v, _BIG)
-        total = padded[target] + costs[t][None, :]
-        best = np.argmin(total, axis=1)
-        choice[t] = best
-        v = total[rows, best]
+        padded[:s] = v
+        np.take(padded, target, out=total)
+        total += costs[t]
+        best = total.argmin(axis=1)  # first minimum = smallest action on ties
+        if t < keep:
+            choice[t] = best
+        v = flat.take(row_base + best)
         if progress is not None and t % 512 == 0:
             progress((n - t) / n)
     return Solution(b, levels, deltas, choice, v, buy, sell, k0)
+
+
+def solve_choice(
+    b: Battery, buy: np.ndarray, sell: np.ndarray, terminal: Terminal, keep: int | None
+) -> np.ndarray:
+    """Worker entry point (picklable): only the decision table of the first ``keep`` rows."""
+    return solve(b, buy, sell, terminal, keep=keep).choice
 
 
 def step_at(sol: Solution, t: int, state: int) -> tuple[Step, int]:

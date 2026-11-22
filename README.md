@@ -29,6 +29,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
   - [Záporné ceny (`--buy-negative`, `--sell-negative`)](#záporné-ceny---buy-negative---sell-negative)
   - [Měsíční poplatky](#měsíční-poplatky)
 - [Algoritmus](#algoritmus)
+  - [Rychlost a paralelní výpočet (`--jobs`)](#rychlost-a-paralelní-výpočet---jobs)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
 - [Výstupy](#výstupy)
 - [Konfigurační soubor](#konfigurační-soubor)
@@ -202,6 +203,7 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `--from DATUM`, `--to DATUM` | období (`RRRR-MM-DD` nebo `RRRR-MM` = celý měsíc), nejpozději do včerejška |
 | `-b month\|day\|none` | rozpis (výchozí po měsících) |
 | `--no-foresight` | nepočítat srovnání s dokonalou znalostí budoucnosti |
+| `-j`, `--jobs N` | počet paralelních procesů pro výpočet (výchozí `auto` = počet jader CPU, `1` = sériově); výsledek je pro každé N **stejný** – viz [Rychlost a paralelní výpočet](#rychlost-a-paralelní-výpočet---jobs) |
 | `--no-progress` | nezobrazovat průběh výpočtu (viz níže) |
 | `-o FILE` | všechny čtvrthodiny do `.csv`, nebo vše (souhrn, rozpis, čtvrthodiny) do `.json` |
 
@@ -216,10 +218,10 @@ ukazuje na stderr jednoduchý řádek s procenty, počtem zpracovaných dní a o
 Řádek se překresluje znakem `\r` (jen ASCII, funguje i ve Windows a Termuxu, bez dalších
 závislostí) a po skončení se smaže. Zobrazí se **jen když je stderr terminál** a není zadáno
 `--json` – při přesměrování do souboru, v rouře nebo cronu se nic nevypisuje. Standardní
-výstup ani soubor z `-o` neovlivní. Vypnout jde volbou `--no-progress`. Se srovnáním
-s ideálem připadá zhruba 60 % pruhu na klouzavou simulaci a 40 % na výpočet ideálu,
-s `--no-foresight` celý pruh na simulaci. Po dokončení pruh vždy ukáže 100 %; odhad
-zbývajícího času se zobrazí až po prvních procentech výpočtu.
+výstup ani soubor z `-o` neovlivní. Vypnout jde volbou `--no-progress`. Procenta odpovídají hotové práci optimalizátoru –
+přepočtům klouzavého plánu a výpočtu ideálu, váženým počtem čtvrthodin – ať běží za sebou,
+nebo paralelně. Po dokončení pruh vždy ukáže 100 %; odhad zbývajícího času se zobrazí až po
+prvních procentech výpočtu.
 
 ## Jak se počítá cena
 
@@ -351,6 +353,46 @@ v Termuxu problematická) a vyloučení současného nabíjení a vybíjení by 
 s celočíselnými proměnnými. DP v numpy spočítá den a půl (≈140 čtvrthodin) za několik
 milisekund. Jediná daň za mřížku: maximální výkon se zaokrouhlí dolů na celý krok mřížky
 (u 5 kW baterie např. 4,95 kW místo 5 kW, tj. < 1 %); jemnější krok nastavíte `--soc-step`.
+
+### Rychlost a paralelní výpočet (`--jobs`)
+
+Backtest se skládá z mnoha nezávislých úloh. **Zpětný průchod DP** (funkce hodnoty a nejlepší
+akce pro každý stav) každého přepočtu závisí jen na cenách známých v okamžiku zveřejnění –
+**ne na stavu baterie**. Všechny přepočty (≈ jeden za den) i výpočet ideálu se proto dají
+spočítat současně; potom se jen postupně, čtvrthodinu po čtvrthodině, přenese SoC přes
+uložené tabulky rozhodnutí (dopředný průchod). Výsledek je tak **bit po bitu stejný** jako při
+sériovém výpočtu i jako v předchozí verzi programu (testy porovnávají každou čtvrthodinu
+včetně všech čísel; ověřeno i na skutečných cenách červen–říjen 2026 – CSV i JSON jsou bajt
+po bajtu shodné).
+
+- `--jobs auto` (výchozí) použije tolik procesů, kolik má počítač jader; přepočty běží
+  v samostatných procesech, výpočet ideálu ve vlákně hlavního procesu. U krátkých období
+  (méně než ~1 500 čtvrthodin práce na proces) se paralelismus nevyplatí a výpočet běží
+  sériově. `--jobs 1` vynutí sériový výpočet.
+- Procesy, ne vlákna: jeden krok DP je malá operace numpy (≈ 36 000 čísel), během níž drží
+  Python zámek GIL – vlákna zrychlila jen asi 2×, procesy škálují s počtem jader (měřeno).
+- Windows (spouštění procesů metodou *spawn*) funguje; kde procesy vytvořit nelze (např.
+  Termux / Android bez funkčního `sem_open`), program tiše počítá sériově – se stejným
+  výsledkem.
+- `plan` řeší jedinou úlohu (≈ 50–140 čtvrthodin) za několik milisekund; většinu z ~0,2 s
+  zabere start Pythonu, paralelismus tu nemá co zrychlit.
+
+Další zrychlení bez vlivu na výsledek: časy zveřejnění se počítají jednou na den (dříve pro
+každý den knihy cen v každé čtvrthodině), cena pro ocenění zbylé energie se bere
+z předpočítaného rozpisu po dnech, nákupní a výkupní ceny se spočítají jednou pro celé období
+a smyčka DP používá předem alokované pole (float64, bez alokací v každém kroku).
+
+Měření (backtest červen–říjen 2026 z příkladu výše, ceny v mezipaměti, 8 jader, celý běh
+programu včetně startu Pythonu):
+
+| | před (0.1.0 bez optimalizací) | `--jobs 1` | `--jobs 4` | `--jobs auto` (8) |
+|---|---:|---:|---:|---:|
+| backtest se srovnáním s ideálem | 5,18 s | 2,45 s | 1,23 s | 1,25 s |
+| backtest `--no-foresight` | 4,13 s | 1,59 s | 0,69 s | 0,54 s |
+
+Se srovnáním s ideálem je nejdelší jednotlivou úlohou samotný výpočet ideálu (≈ 0,85 s,
+zpětný průchod přes celé období je ze své podstaty sekvenční), proto víc než ~4 procesy už
+nepomůžou; bez něj backtest škáluje dál.
 
 ## Zveřejňování cen OTE a backtest
 

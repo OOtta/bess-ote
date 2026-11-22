@@ -82,6 +82,18 @@ def _hhmm(text: str) -> time:
         raise argparse.ArgumentTypeError(f"invalid time {text!r} (use HH:MM)") from exc
 
 
+def _jobs(text: str) -> int | None:
+    if text.strip().lower() == "auto":
+        return None
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a number ≥ 1 or 'auto'") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError("expected a number ≥ 1 or 'auto'")
+    return n
+
+
 def common_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     b = p.add_argument_group("battery")
@@ -318,6 +330,15 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("-b", "--breakdown", choices=["month", "day", "none"], default="month")
     bt.add_argument(
         "--no-foresight", action="store_true", help="skip the perfect-foresight benchmark"
+    )
+    bt.add_argument(
+        "-j",
+        "--jobs",
+        type=_jobs,
+        default=None,
+        metavar="N",
+        help="parallel processes for the independent optimisations (default auto = CPU "
+        "count; 1 = serial). Results are identical for any N",
     )
     bt.add_argument(
         "--no-progress",
@@ -686,36 +707,29 @@ class ProgressBar:
     """Single-line progress on stderr (``\\r`` redraw, ASCII only – safe on Windows/Termux).
 
     Shown only when stderr is a terminal; stdout and exported files are never touched.
-    With the perfect-foresight benchmark the rolling simulation fills 0–60 % and the
-    benchmark 60–100 %; without it the simulation fills the whole bar. The final ``done``
-    event always draws 100 %.
+    The fraction comes from :func:`run_backtest`: DP work done (rolling re-optimisations and
+    the perfect-foresight benchmark weighted by their quarter-hours, whether they run one
+    after another or in parallel). The final ``done`` event always draws 100 %.
     """
 
     WIDTH = 24
-    FORESIGHT_SHARE = 0.4
 
-    def __init__(self, stream: Any, foresight: bool = True) -> None:
+    def __init__(self, stream: Any) -> None:
         self.stream = stream
-        self.share = self.FORESIGHT_SHARE if foresight else 0.0
         self.t0 = monotonic()
         self.last = -1.0
         self.overall = 0.0  # last drawn fraction (never decreases)
         self.shown = False
 
     @classmethod
-    def create(cls, *, enabled: bool, foresight: bool = True) -> ProgressBar | None:
+    def create(cls, *, enabled: bool) -> ProgressBar | None:
         stream = sys.stderr
         if not enabled or stream is None or not getattr(stream, "isatty", lambda: False)():
             return None
-        return cls(stream, foresight)
+        return cls(stream)
 
     def _overall(self, phase: str, fraction: float) -> float:
-        fraction = min(max(fraction, 0.0), 1.0)
-        if phase == "done":
-            return 1.0
-        if phase == "foresight":
-            return 1 - self.share + fraction * self.share
-        return fraction * (1 - self.share)
+        return 1.0 if phase == "done" else min(max(fraction, 0.0), 1.0)
 
     def eta_text(self, overall: float, elapsed: float) -> str:
         if overall >= 1:
@@ -835,16 +849,16 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     # one extra day: on the last day the next day's prices are published at ~13:05
     book = fetch_book(ote_client(args), start, min(end + timedelta(days=1), today))
     info(f"Simulating {start} – {end} ...")
-    bar = ProgressBar.create(
-        enabled=not (args.json or args.no_progress), foresight=not args.no_foresight
-    )
+    bar = ProgressBar.create(enabled=not (args.json or args.no_progress))
     try:
         res = run_backtest(book, start, end, tariffs, b, tcfg, soc, publish=pub,
-                           foresight=not args.no_foresight,
+                           foresight=not args.no_foresight, jobs=args.jobs,
                            progress=bar.update if bar else None)  # fmt: skip
     finally:
         if bar:
             bar.close()
+    if res.workers > 1:
+        info(f"{res.solves} optimisations solved in parallel on {res.workers} processes")
     for w in res.warnings:
         warn(w)
     if not res.intervals:

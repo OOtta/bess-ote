@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import date, datetime, time
 
 import numpy as np
 
@@ -72,7 +72,9 @@ def terminal_for(
     battery: Battery,
     tcfg: TerminalConfig,
     initial_soc_kwh: float | None,
+    by_day: dict[date, list[float]] | None = None,
 ) -> Terminal:
+    """``by_day`` = precomputed :meth:`PriceBook.values_by_day` (same values, same order)."""
     if tcfg.mode == "zero" or not starts:
         return Terminal("zero")
     if tcfg.mode == "min-soc":
@@ -82,11 +84,14 @@ def terminal_for(
     price = tcfg.price_czk_kwh
     if price is None:
         last = local_date(starts[-1])
-        vals = [
-            tariffs.sell_czk_kwh(v)
-            for t, v in book.spot.items()
-            if local_date(t) == last and not math.isnan(v)
-        ]
+        if by_day is not None:
+            vals = [tariffs.sell_czk_kwh(v) for v in by_day.get(last, [])]
+        else:
+            vals = [
+                tariffs.sell_czk_kwh(v)
+                for t, v in book.spot.items()
+                if local_date(t) == last and not math.isnan(v)
+            ]
         price = sum(vals) / len(vals) if vals else 0.0
     per_stored = (max(0.0, price) - battery.cycle_cost_czk_kwh) * battery.discharge_eff
     return Terminal("value", czk_per_kwh_stored=max(0.0, per_stored))

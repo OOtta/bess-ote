@@ -36,5 +36,21 @@ First version of **bess-ote** (BESS OTE kalkulačka).
   off. With `--no-foresight` the rolling simulation fills the whole bar (60 / 40 split only
   when the benchmark runs); the bar always ends at 100 % (also when the benchmark is skipped
   because of gaps) and the ETA appears only once it is meaningful.
+- Faster backtest, bit-for-bit identical results (tests compare every interval with the
+  previous serial loop; live June–October 2026 CSV/JSON byte-identical):
+  - `-j/--jobs N` (default auto = `os.cpu_count()`, 1 = serial): the DP backward passes of
+    all re-optimisations depend only on the prices known at each publication, not on the
+    state of charge, so they run in a process pool; the perfect-foresight DP runs on a
+    thread in the main process; the state of charge is then carried through the stored
+    decision tables sequentially. Processes rather than threads (threads scaled ~2× because
+    of the GIL); falls back to serial where a process pool is unavailable (Termux) or for
+    short periods. `python -m bess_ote` is guarded for spawn-based platforms (Windows).
+  - Serial speedups: publication times memoised and only the horizon end computed per
+    quarter (was ~40 % of the runtime), terminal day averages from a per-day index, buy/sell
+    prices computed once per period, DP loop with preallocated float64 buffers.
+  - Live example (153 days, warm cache, 8 CPUs): 5.18 s → 2.45 s serial, 1.25 s auto;
+    `--no-foresight` 4.13 s → 0.54 s.
+  - Progress bar fraction = DP work done (rolling solves and the benchmark weighted by
+    quarter-hours), correct for serial and parallel runs.
 - Czech README explains the negative-price modes for purchase and sale
   (`--buy-negative`, `--sell-negative`) with example tables.

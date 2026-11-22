@@ -59,6 +59,16 @@ class PriceBook:
 
     spot: dict[datetime, float] = field(default_factory=dict)
     resolution: dict[date, str] = field(default_factory=dict)
+    _pub: dict[tuple[date, time | None], datetime] = field(
+        default_factory=dict, repr=False, compare=False
+    )  # memoised publication_utc (a pure function of day and override)
+
+    def publication(self, day: date, publish: time | None = None) -> datetime:
+        key = (day, publish)
+        pub = self._pub.get(key)
+        if pub is None:
+            pub = self._pub[key] = publication_utc(day, publish)
+        return pub
 
     @classmethod
     def from_points(cls, points: Iterable[PricePoint]) -> PriceBook:
@@ -84,7 +94,29 @@ class PriceBook:
         """Days whose prices are in the book and published by ``at`` (None = all)."""
         if at is None:
             return set(self.resolution)
-        return {d for d in self.resolution if publication_utc(d, publish) <= at}
+        return {d for d in self.resolution if self.publication(d, publish) <= at}
+
+    def _known(self, d: date, at: datetime | None, publish: time | None) -> bool:
+        return d in self.resolution and (at is None or self.publication(d, publish) <= at)
+
+    def horizon_end(
+        self, start: datetime, at: datetime | None, publish: time | None = None
+    ) -> datetime | None:
+        """Last quarter start of :meth:`horizon` (None if empty) without building the list."""
+        d = local_date(start)
+        if not self._known(d, at, publish):
+            return None
+        while self._known(d + timedelta(days=1), at, publish):
+            d += timedelta(days=1)
+        return local_midnight_utc(d + timedelta(days=1)) - QUARTER
+
+    def values_by_day(self) -> dict[date, list[float]]:
+        """Non-NaN spot prices grouped by local day, in the book's iteration order."""
+        out: dict[date, list[float]] = {}
+        for t, v in self.spot.items():
+            if not math.isnan(v):
+                out.setdefault(local_date(t), []).append(v)
+        return out
 
     def horizon(
         self, start: datetime, at: datetime | None, publish: time | None = None

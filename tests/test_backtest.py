@@ -10,7 +10,8 @@ import pytest
 from bess_ote.backtest import run_backtest
 from bess_ote.battery import Battery
 from bess_ote.lowtariff import LowTariffSchedule
-from bess_ote.planner import TerminalConfig, plan
+from bess_ote.optimizer import solve, step_at
+from bess_ote.planner import TerminalConfig, build_problem, plan
 from bess_ote.tariff import Distribution, SpotFormula, Tariffs
 from bess_ote.timeutil import PRAGUE, QUARTER, local_midnight_utc
 from conftest import synthetic_book
@@ -123,17 +124,21 @@ def test_monthly_fees_prorated_by_days_and_do_not_change_decisions():
     assert fees.fees_for_day(d) == pytest.approx(monthly / 31)
 
 
+@pytest.mark.parametrize("jobs", [1, 3])
 @pytest.mark.parametrize("foresight", [True, False])
-def test_progress_callback_reaches_100_percent(foresight):
+def test_progress_callback_reaches_100_percent(foresight, jobs, monkeypatch):
+    monkeypatch.setattr("bess_ote.backtest.MIN_UNITS_PER_WORKER", 1)  # force a pool
     book = synthetic_book(date(2026, 6, 1), 4)
     seen = []
-    run_backtest(book, date(2026, 6, 1), date(2026, 6, 3), T, B, TerminalConfig(), 1.0,
-                 foresight=foresight,
-                 progress=lambda ph, f, det: seen.append((ph, f, det)))  # fmt: skip
+    res = run_backtest(book, date(2026, 6, 1), date(2026, 6, 3), T, B, TerminalConfig(), 1.0,
+                       foresight=foresight, jobs=jobs,
+                       progress=lambda ph, f, det: seen.append((ph, f, det)))  # fmt: skip
+    assert res.workers == (1 if jobs == 1 else 2 if foresight else 3)
     sim = [s for s in seen if s[0] == "simulate"]
-    assert sim[0][1] == 0 and sim[-1][1] == 1.0 and sim[-1][2] == "3/3 days"
+    assert sim[0][1] == 0 and sim[-1][1] == pytest.approx(1.0)
     assert all(a[1] <= b[1] for a, b in pairwise(sim))
-    assert any(s[0] == "foresight" for s in seen) is foresight
+    if not foresight:
+        assert all(s[2] != "perfect foresight" for s in seen)
     assert seen[-1] == ("done", 1.0, "3/3 days")  # final reported fraction == 1.0
 
 
@@ -155,3 +160,114 @@ def test_single_day_progress():
     run_backtest(book, date(2026, 6, 1), date(2026, 6, 1), T, B, TerminalConfig(), 1.0,
                  progress=lambda ph, f, det: seen.append((ph, f)))  # fmt: skip
     assert seen[0] == ("simulate", 0.0) and seen[-1] == ("done", 1.0)
+
+
+def reference_backtest(book, start, end, tariffs, battery, tcfg, soc, publish=None):
+    """The previous (pre-parallel) serial loop, kept verbatim as the accuracy reference."""
+    t = local_midnight_utc(start)
+    t_end = local_midnight_utc(end + timedelta(days=1))
+    prob = sol = state = None
+    prob_idx = {}
+    out = []
+    while t < t_end:
+        horizon = book.horizon(t, t, publish)
+        if not horizon:
+            t += QUARTER
+            continue
+        if prob is None or prob.starts[-1] != horizon[-1] or t not in prob_idx:
+            prob = build_problem(book, t, t, tariffs, battery, tcfg, publish=publish,
+                                 horizon=horizon, initial_soc_kwh=soc)  # fmt: skip
+            sol = solve(battery, prob.buy, prob.sell, prob.terminal)
+            prob_idx = {s: i for i, s in enumerate(prob.starts)}
+            if state is None:
+                state = sol.state_index(soc)
+        off = prob_idx[t]
+        st, state = step_at(sol, off, state)
+        out.append((t, float(prob.spot[off]), float(prob.buy[off]), float(prob.sell[off]),
+                    replace(st, index=0), prob.starts[-1] + QUARTER))  # fmt: skip
+        t += QUARTER
+    return out
+
+
+def _flat(res):
+    return [(iv.start, iv.spot_czk_mwh, iv.buy_czk_kwh, iv.sell_czk_kwh,
+             replace(iv.step, index=0), iv.horizon_end) for iv in res.intervals]  # fmt: skip
+
+
+B2 = Battery(7, 3, discharge_kw=4, soc_min_pct=5, soc_max_pct=90, cycle_cost_czk_kwh=0.3)
+
+
+@pytest.mark.parametrize(
+    ("battery", "tcfg", "pub", "hourly"),
+    [
+        (B, TerminalConfig(), None, False),
+        (B, TerminalConfig("min-soc", None, 40), time(14, 20), False),
+        (B2, TerminalConfig("zero"), None, True),
+        (B2, TerminalConfig("value", 2.5, None), time(11, 0), False),
+    ],
+)
+def test_parallel_is_bit_identical_to_serial_and_previous_version(
+    battery, tcfg, pub, hourly, monkeypatch
+):
+    monkeypatch.setattr("bess_ote.backtest.MIN_UNITS_PER_WORKER", 1)  # force the pool
+    first = date(2025, 9, 20) if hourly else date(2026, 6, 1)
+    book = synthetic_book(first, 22, hourly=hourly, seed=7)
+    args = (book, first + timedelta(days=1), first + timedelta(days=19), T, battery, tcfg, 3.0)
+    serial = run_backtest(*args, publish=pub, jobs=1)
+    par = run_backtest(*args, publish=pub, jobs=4)
+    assert serial.workers == 1 and par.workers == 3
+    assert _flat(par) == _flat(serial)  # every interval, every float, bit for bit
+    assert par.totals == serial.totals and par.foresight == serial.foresight
+    assert par.end_soc_kwh == serial.end_soc_kwh and par.solves == serial.solves
+    assert par.foresight_end_soc_kwh == serial.foresight_end_soc_kwh
+    assert _flat(serial) == reference_backtest(*args, publish=pub)
+
+
+def test_parallel_with_gaps_and_auto_jobs(monkeypatch):
+    monkeypatch.setattr("bess_ote.backtest.MIN_UNITS_PER_WORKER", 1)
+    book = synthetic_book(date(2026, 6, 1), 12, seed=3)
+    a, b = local_midnight_utc(date(2026, 6, 5)), local_midnight_utc(date(2026, 6, 6))
+    for t in [t for t in book.spot if a <= t < b]:
+        del book.spot[t]
+    del book.resolution[date(2026, 6, 5)]
+    args = (book, date(2026, 6, 1), date(2026, 6, 10), T, B, TerminalConfig(), 1.0)
+    serial = run_backtest(*args, jobs=1)
+    auto = run_backtest(*args, jobs=None)
+    assert _flat(auto) == _flat(serial) == reference_backtest(*args)
+    assert auto.skipped_intervals == serial.skipped_intervals == 96
+    assert auto.warnings == serial.warnings and auto.foresight is None
+
+
+def test_pool_unavailable_falls_back_to_serial(monkeypatch):
+    monkeypatch.setattr("bess_ote.backtest.MIN_UNITS_PER_WORKER", 1)
+    monkeypatch.setattr("bess_ote.backtest.make_process_pool", lambda n: None)  # e.g. Termux
+    book = synthetic_book(date(2026, 6, 1), 6)
+    args = (book, date(2026, 6, 1), date(2026, 6, 5), T, B, TerminalConfig(), 1.0)
+    res = run_backtest(*args, jobs=8)
+    assert res.workers == 1 and _flat(res) == reference_backtest(*args)
+
+
+def test_horizon_end_matches_horizon():
+    book = synthetic_book(date(2026, 6, 1), 5)
+    t = local_midnight_utc(date(2026, 5, 31))
+    while t < local_midnight_utc(date(2026, 6, 7)):
+        for pub in (None, time(14, 20)):
+            h = book.horizon(t, t, pub)
+            assert book.horizon_end(t, t, pub) == (h[-1] if h else None)
+        t += QUARTER
+
+
+def test_spawn_start_method_like_windows(monkeypatch):
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    monkeypatch.setattr("bess_ote.backtest.MIN_UNITS_PER_WORKER", 1)
+    ctx = multiprocessing.get_context("spawn")
+    monkeypatch.setattr(
+        "bess_ote.backtest.make_process_pool",
+        lambda n: ProcessPoolExecutor(max_workers=n, mp_context=ctx),
+    )
+    book = synthetic_book(date(2026, 6, 1), 6)
+    args = (book, date(2026, 6, 1), date(2026, 6, 5), T, B, TerminalConfig(), 1.0)
+    res = run_backtest(*args, jobs=3)
+    assert res.workers == 2 and _flat(res) == reference_backtest(*args)
