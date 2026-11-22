@@ -271,3 +271,21 @@ def test_spawn_start_method_like_windows(monkeypatch):
     args = (book, date(2026, 6, 1), date(2026, 6, 5), T, B, TerminalConfig(), 1.0)
     res = run_backtest(*args, jobs=3)
     assert res.workers == 2 and _flat(res) == reference_backtest(*args)
+
+
+def test_fine_breakdown_keeps_skipped_quarters_and_fees():
+    book = synthetic_book(date(2026, 6, 1), 6, seed=4)
+    a, b = local_midnight_utc(date(2026, 6, 3)), local_midnight_utc(date(2026, 6, 4))
+    for t in [t for t in book.spot if a <= t < b]:
+        del book.spot[t]
+    del book.resolution[date(2026, 6, 3)]
+    fees = replace(T, buy_monthly_fee=300, buy_vat_percent=21)
+    res = run_backtest(book, date(2026, 6, 1), date(2026, 6, 4), fees, B, TerminalConfig(), 1.0)
+    for by, n in (("hour", 96), ("quarter-hour", 384)):
+        rows = res.breakdown(by)
+        assert len(rows) == n
+        idle = [r for r in rows if r["action"] == "no price"]
+        assert len(idle) == n // 4 and all(r["spot_czk_mwh"] is None for r in idle)
+        assert all(r["pattern"] in ("....", ".") for r in idle)
+        assert sum(r["fees_czk"] for r in rows) == pytest.approx(res.totals.fees_czk, abs=1e-3)
+        assert sum(r["profit_czk"] for r in rows) == pytest.approx(res.totals.profit_czk, abs=0.01)

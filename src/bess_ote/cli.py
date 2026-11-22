@@ -16,6 +16,7 @@ from typing import Any
 from bess_ote import __version__
 from bess_ote.backtest import BacktestResult, run_backtest
 from bess_ote.battery import DT_H, Battery, BatteryError
+from bess_ote.breakdown import FINE, Quarter, fine_rows, normalise
 from bess_ote.cache import JsonCache, default_cache_dir
 from bess_ote.cnb import CnbRates
 from bess_ote.config import Config, ConfigError, load_config
@@ -80,6 +81,21 @@ def _hhmm(text: str) -> time:
         return datetime.strptime(text.strip(), "%H:%M").time()
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid time {text!r} (use HH:MM)") from exc
+
+
+def _breakdown_type(*allowed: str):  # type: ignore[no-untyped-def]
+    def parse(text: str) -> str:
+        try:
+            by = normalise(text)
+        except ValueError:
+            by = ""
+        if by not in allowed:
+            raise argparse.ArgumentTypeError(
+                f"choose from {', '.join(allowed)} (aliases: d, h/60min, qh/15min/quarter)"
+            )
+        return by
+
+    return parse
 
 
 def _jobs(text: str) -> int | None:
@@ -306,6 +322,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pl.add_argument("--next", action="store_true", help="show only the next quarter-hour action")
     pl.add_argument("-o", "--export", metavar="FILE", help="write the schedule (.csv or .json)")
+    pl.add_argument(
+        "-b",
+        "--breakdown",
+        type=_breakdown_type("hour", "quarter-hour"),
+        default=None,
+        metavar="BY",
+        help="hour = aggregate the table per hour (sums of energy/money, average prices); "
+        "quarter-hour = native rows (default). Adds 'breakdown' to JSON",
+    )
+    pl.add_argument("--breakdown-csv", metavar="FILE", help="write the breakdown rows as CSV")
     pl.set_defaults(func=cmd_plan)
 
     bt = sub.add_parser(
@@ -328,7 +354,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DATE",
         help="last day incl. (YYYY-MM-DD or YYYY-MM = whole month); default = --from",
     )
-    bt.add_argument("-b", "--breakdown", choices=["month", "day", "none"], default="month")
+    bt.add_argument(
+        "-b",
+        "--breakdown",
+        type=_breakdown_type("month", "day", "hour", "quarter-hour", "none"),
+        default="none",
+        metavar="BY",
+        help="breakdown rows: month, day, hour (h, 60min), quarter-hour (qh, 15min); default "
+        "none = summary only",
+    )
+    bt.add_argument("--breakdown-csv", metavar="FILE", help="write the breakdown rows as CSV")
     bt.add_argument(
         "--no-foresight", action="store_true", help="skip the perfect-foresight benchmark"
     )
@@ -642,6 +677,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "next": rows[0],
         "summary": summary | {"soc_end_pct": rows[-1]["soc_end_pct"]},
     }  # fmt: skip
+    by = getattr(args, "breakdown", None)
+    fine: list[dict[str, Any]] | None = None
+    if by:
+        fine = fine_rows(plan_quarters(res, tariffs), b, by)
+        doc["breakdown"] = {"by": by, "rows": fine}
+    if args.breakdown_csv:
+        write_csv(Path(args.breakdown_csv), fine if fine is not None else rows)
+        info(f"Wrote {args.breakdown_csv}")
     if not args.next:
         doc["intervals"] = rows
     if args.export:
@@ -660,6 +703,54 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"{k.capitalize() + ':':<13} {v}")
     print(f"Terminal:     {_terminal_text(term, b)}")
     print()
+    if by == "hour" and fine is not None:
+        render_fine(fine, "hour", bool(summary["fees_czk"]))
+    else:
+        _plan_table(rows, res)
+    print()
+    print(f"Horizon total: bought {summary['bought_kwh']:.2f} kWh for {summary['cost_czk']:.2f} "
+          f"CZK, sold {summary['sold_kwh']:.2f} kWh for {summary['revenue_czk']:.2f} CZK, "
+          f"wear {summary['wear_czk']:.2f} CZK → profit {summary['profit_czk']:.2f} CZK; "
+          f"SoC at the end {rows[-1]['soc_end_pct']:.1f} %")  # fmt: skip
+    if summary["fees_czk"]:
+        print(f"Monthly fees prorated to the horizon: {summary['fees_czk']:.2f} CZK → net "
+              f"{summary['net_profit_czk']:.2f} CZK")  # fmt: skip
+    return 0
+
+
+def plan_quarters(res: PlanResult, tariffs: Tariffs) -> list[Quarter]:
+    out, soc = [], res.soc_kwh
+    p = res.problem
+    for t, spot, buy, sell, st in zip(p.starts, p.spot, p.buy, p.sell, res.steps, strict=True):
+        out.append(Quarter(t, float(spot), float(buy), float(sell), st, soc,
+                           tariffs.fees_for_quarter(t)))  # fmt: skip
+        soc = st.soc_kwh
+    return out
+
+
+def render_fine(rows: list[dict[str, Any]], by: str, fees: bool) -> None:
+    """Text table of hour / quarter-hour rows (times local, with CET/CEST)."""
+    extra = f" {'fees':>8} {'net':>9}" if fees else ""
+    head = "acts" if by == "hour" else ""
+    print(f"{by:<21} {head:<4} {'action':<17} {'spot':>8} {'buy':>7} {'sell':>7} {'bought':>8} "
+          f"{'sold':>8} {'SoC %':>6} {'profit':>9}{extra}")  # fmt: skip
+    print(f"{'(local)':<21} {'':<4} {'':<17} {'CZK/MWh':>8} {'CZK/kWh':>7} {'CZK/kWh':>7} "
+          f"{'kWh':>8} {'kWh':>8} {'end':>6} {'CZK':>9}")  # fmt: skip
+
+    def num(v: float | None, spec: str) -> str:
+        return "–" if v is None else format(v, spec)
+
+    for r in rows:
+        t = datetime.fromisoformat(r["period"])
+        pat = r["pattern"] if by == "hour" else ""
+        extra = f" {r['fees_czk']:>8.3f} {r['net_profit_czk']:>9.3f}" if fees else ""
+        print(f"{fmt_local(t):<21} {pat:<4} {r['action']:<17} {num(r['spot_czk_mwh'], '.2f'):>8} "
+              f"{num(r['buy_czk_kwh'], '.3f'):>7} {num(r['sell_czk_kwh'], '.3f'):>7} "
+              f"{r['bought_kwh']:>8.3f} {r['sold_kwh']:>8.3f} {r['soc_end_pct']:>6.1f} "
+              f"{r['profit_czk']:>9.3f}{extra}")  # fmt: skip
+
+
+def _plan_table(rows: list[dict[str, Any]], res: PlanResult) -> None:
     print(f"{'time':<20} {'spot':>9} {'buy':>7} {'sell':>7}  {'action':<9} {'kW':>6} "
           f"{'grid kWh':>9} {'SoC %':>6} {'CZK':>8}")  # fmt: skip
     print(f"{'(local)':<20} {'CZK/MWh':>9} {'CZK/kWh':>7} {'CZK/kWh':>7}")
@@ -670,15 +761,6 @@ def cmd_plan(args: argparse.Namespace) -> int:
         print(f"{fmt_local(t):<20} {spot:>9} {buy:>7} {sell:>7}  {r['action']:<9} "
               f"{r['power_kw']:>6.2f} {r['grid_kwh']:>9.3f} {r['soc_end_pct']:>6.1f} "
               f"{r['cash_czk']:>8.2f}")  # fmt: skip
-    print()
-    print(f"Horizon total: bought {summary['bought_kwh']:.2f} kWh for {summary['cost_czk']:.2f} "
-          f"CZK, sold {summary['sold_kwh']:.2f} kWh for {summary['revenue_czk']:.2f} CZK, "
-          f"wear {summary['wear_czk']:.2f} CZK → profit {summary['profit_czk']:.2f} CZK; "
-          f"SoC at the end {rows[-1]['soc_end_pct']:.1f} %")  # fmt: skip
-    if summary["fees_czk"]:
-        print(f"Monthly fees prorated to the horizon: {summary['fees_czk']:.2f} CZK → net "
-              f"{summary['net_profit_czk']:.2f} CZK")  # fmt: skip
-    return 0
 
 
 def _terminal_text(term, b: Battery) -> str:  # type: ignore[no-untyped-def]
@@ -695,6 +777,11 @@ def export_rows(path: Path, rows: list[dict[str, Any]], doc: dict[str, Any]) -> 
         path.write_text(dump_json(doc | {"warnings": list(_RUN.warnings)}) + "\n",
                         encoding="utf-8")  # fmt: skip
         return
+    write_csv(path, rows)
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]) if rows else ["start"])
         w.writeheader()
@@ -867,6 +954,11 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     doc = backtest_doc(res, tariffs, pub)
     if args.breakdown != "none":
         doc["breakdown"] = {"by": args.breakdown, "rows": res.breakdown(args.breakdown)}
+    if args.breakdown_csv:
+        if args.breakdown == "none":
+            raise CliError("--breakdown-csv needs a breakdown (-b month|day|hour|quarter-hour)")
+        write_csv(Path(args.breakdown_csv), doc["breakdown"]["rows"])
+        info(f"Wrote {args.breakdown_csv}")
     if args.export:
         rows = backtest_rows(res, tariffs)
         export_rows(Path(args.export), rows, doc | {"intervals": rows})
@@ -918,7 +1010,10 @@ def render_backtest(doc: dict[str, Any]) -> None:
               f"{f['profit_incl_stored_energy_czk']:.2f} CZK incl. stored energy, "
               f"{f['cycles']:.1f} cycles; rolling plan captures {cap}")  # fmt: skip
     br = doc.get("breakdown")
-    if br:
+    if br and br["by"] in FINE:
+        print()
+        render_fine(br["rows"], br["by"], bool(s["fees_czk"]))
+    elif br:
         print()
         fees = bool(s["fees_czk"])
         extra = f" {'fees':>9} {'net':>10}" if fees else ""

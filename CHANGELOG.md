@@ -66,5 +66,15 @@ First version of **bess-ote** (BESS OTE kalkulačka).
   grid; 10 kWh `--jobs auto` 1.25 s → 2.36 s), `--soc-step` overrides. Long perfect-foresight
   runs on big batteries keep value-function checkpoints instead of the full decision table
   (bit-identical, bounded memory); decision tables are int8 when possible.
+- Hour and quarter-hour breakdowns: `backtest -b hour|quarter-hour` (aliases `h`, `60min`,
+  `qh`, `15min`, `quarter`; also `d` for day) and `plan -b hour|quarter-hour`; rows with local
+  time, actions (`pattern` per quarter: C/D/-/.), average prices, energy, SoC, cost, revenue,
+  profit, fees and net (sums – totals equal the summary; prices = simple averages, i.e. the
+  hourly price until 2025-09-30); DST days give 23 / 25 hourly rows (92 / 100 quarters);
+  quarter-hours without prices kept as `no price` rows. `--breakdown-csv FILE` writes the
+  breakdown rows as CSV (backtest and plan). JSON gets a `breakdown` object.
+- **Changed default:** `backtest -b` now defaults to `none` (summary only); the monthly table
+  that used to be printed by default needs `-b month`. `plan` prints a breakdown only with
+  `-b` as well.
 - Czech README explains the negative-price modes for purchase and sale
   (`--buy-negative`, `--sell-negative`) with example tables.

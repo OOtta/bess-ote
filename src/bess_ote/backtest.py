@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 from bess_ote.battery import Battery
+from bess_ote.breakdown import FINE, Quarter, fine_rows
 from bess_ote.market import PriceBook
 from bess_ote.optimizer import (
     Solution,
@@ -114,8 +115,30 @@ class BacktestResult:
     warnings: list[str] = field(default_factory=list)
     fees_by_day: dict[date, float] = field(default_factory=dict)
     workers: int = 1  # worker processes used for the DP solves (1 = serial)
+    tariffs: Tariffs | None = None
+
+    def quarters(self) -> list[Quarter]:
+        """Every quarter-hour of the period, skipped ones (no price) as idle quarters."""
+        by_start = {iv.start: iv for iv in self.intervals}
+        fee = self.tariffs.fees_for_quarter if self.tariffs is not None else (lambda t: 0.0)
+        out, soc = [], self.initial_soc_kwh
+        t, t_end = local_midnight_utc(self.start), local_midnight_utc(self.end + timedelta(days=1))
+        while t < t_end:
+            iv = by_start.get(t)
+            if iv is None:
+                out.append(Quarter(t, math.nan, math.nan, math.nan, None, soc, fee(t)))
+            else:
+                out.append(Quarter(t, iv.spot_czk_mwh, iv.buy_czk_kwh, iv.sell_czk_kwh, iv.step,
+                                   soc, fee(t)))  # fmt: skip
+                soc = iv.step.soc_kwh
+            t += QUARTER
+        return out
 
     def breakdown(self, by: str) -> list[dict]:
+        """Rows per ``month`` / ``day`` (totals) or ``hour`` / ``quarter-hour`` (see
+        :mod:`bess_ote.breakdown`)."""
+        if by in FINE:
+            return fine_rows(self.quarters(), self.battery, by)
         groups: dict[str, Totals] = defaultdict(Totals)
 
         def key(d: date) -> str:
@@ -278,6 +301,7 @@ def run_backtest(
                          len(events), skipped_intervals=skipped, warnings=warnings)  # fmt: skip
     res.terminal_value_czk_kwh = terminal_value
     res.workers = workers
+    res.tariffs = tariffs
     d = start
     while d <= end:
         res.fees_by_day[d] = tariffs.fees_for_day(d)

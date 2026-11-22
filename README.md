@@ -33,6 +33,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
   - [Rychlost a paralelní výpočet (`--jobs`)](#rychlost-a-paralelní-výpočet---jobs)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
 - [Výstupy](#výstupy)
+  - [Rozpis po hodinách a čtvrthodinách](#rozpis-po-hodinách-a-čtvrthodinách)
 - [Konfigurační soubor](#konfigurační-soubor)
 - [Data a mezipaměť](#data-a-mezipaměť)
 - [Omezení](#omezení)
@@ -76,7 +77,7 @@ bess-ote plan -c 10 -p 5 --soc 40 \
 bess-ote plan -c 10 -p 5 --soc 30 --at "2026-11-21 13:20" -o plan.csv
 
 # Backtest za červen–říjen 2026 se stejnými tarify a měsíčními poplatky, rozpis po měsících
-bess-ote backtest -c 10 -p 5 --soc-min 10 --from 2026-06 --to 2026-10 \
+bess-ote backtest -c 10 -p 5 --soc-min 10 --from 2026-06 --to 2026-10 -b month \
   -a 400 --buy-vat 21 --sell-add -300 --buy-monthly-fee 147 --distribution-monthly-fee 257 \
   --distribution-high 2.435 --distribution-low 0.416 \
   --low-tariff-hours "1:15-5:15,12:30-16:30" \
@@ -196,13 +197,16 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `--next` | vypsat jen akci na příští čtvrthodinu |
 | `--at "RRRR-MM-DD HH:MM"` | plán k danému místnímu času; použijí se jen ceny zveřejněné do té doby. Bez `--at` = teď, se vším, co OTE už zveřejnil |
 | `-o FILE` | rozvrh do `.csv` nebo `.json` |
+| `-b hour\|quarter-hour` | rozpis: `hour` (alias `h`, `60min`) = tabulka sečtená po hodinách, `quarter-hour` (alias `qh`, `15min`, `quarter`) = po čtvrthodinách; v JSON navíc pole `breakdown`. Bez volby se vypíše běžná čtvrthodinová tabulka – viz [Rozpis po hodinách a čtvrthodinách](#rozpis-po-hodinách-a-čtvrthodinách) |
+| `--breakdown-csv FILE` | řádky rozpisu do CSV (bez `-b` čtvrthodiny rozvrhu) |
 
 **`backtest`**
 
 | Volba | Význam |
 |---|---|
 | `--from DATUM`, `--to DATUM` | období (`RRRR-MM-DD` nebo `RRRR-MM` = celý měsíc), nejpozději do včerejška |
-| `-b month\|day\|none` | rozpis (výchozí po měsících) |
+| `-b month\|day\|hour\|quarter-hour\|none` | rozpis po měsících, dnech (`d`), hodinách (`h`, `60min`) nebo čtvrthodinách (`qh`, `15min`, `quarter`); **výchozí `none`** = jen souhrn – viz [Rozpis po hodinách a čtvrthodinách](#rozpis-po-hodinách-a-čtvrthodinách) |
+| `--breakdown-csv FILE` | řádky zvoleného rozpisu do CSV |
 | `--no-foresight` | nepočítat srovnání s dokonalou znalostí budoucnosti |
 | `-j`, `--jobs N` | počet paralelních procesů pro výpočet (výchozí `auto` = počet jader CPU, `1` = sériově); výsledek je pro každé N **stejný** – viz [Rychlost a paralelní výpočet](#rychlost-a-paralelní-výpočet---jobs) |
 | `--no-progress` | nezobrazovat průběh výpočtu (viz níže) |
@@ -488,6 +492,73 @@ cen. Oba výsledky se porovnávají včetně změny hodnoty energie v baterii (o
   cash_czk, fees_czk` (podíl měsíčních poplatků na čtvrthodinu) (+ u backtestu `known_until` =
   konec cen známých v tu chvíli).
 - **`-o soubor.json`** – totéž co `--json` včetně všech čtvrthodin.
+- **`--breakdown-csv soubor.csv`** – řádky rozpisu (`-b`) jako CSV.
+
+### Rozpis po hodinách a čtvrthodinách
+
+Rozpis se vypíše **jen s volbou `-b`** (výchozí je `none`; dřív backtest vypisoval rozpis po
+měsících vždy – teď je potřeba `-b month`). `backtest` umí `-b month`, `day`, `hour`
+a `quarter-hour`, `plan` (pokrývá nejvýš den a půl) `hour` a `quarter-hour`:
+
+```text
+bess-ote backtest … --from 2026-10-14 -b hour
+bess-ote backtest … --from 2026-10-14 -b qh --breakdown-csv ctvrthodiny.csv
+bess-ote plan … -b hour --json
+```
+
+Řádek hodinového / čtvrthodinového rozpisu (JSON, CSV): `period` a `end` (místní čas s časovou
+zónou), `quarters` (počet čtvrthodin v řádku), `action` (`charge` / `discharge` / `wait`;
+u hodiny se smíšenými akcemi podle čistého toku energie, `mixed (…)` při nabíjení i vybíjení
+v téže hodině, `no price` = čtvrthodiny bez ceny OTE), `pattern` (průběh hodiny po
+čtvrthodinách: `C` nabíjení, `D` vybíjení, `-` čekání, `.` bez ceny), průměrné ceny
+`spot_czk_mwh`, `buy_czk_kwh`, `sell_czk_kwh`, `power_kw` (průměrný čistý výkon), `grid_kwh`,
+`soc_start_pct`, `soc_end_pct` a součty `bought_kwh`, `cost_czk`, `sold_kwh`, `revenue_czk`,
+`wear_czk`, `profit_czk`, `fees_czk`, `net_profit_czk`.
+
+- **Energie a peníze se sčítají**, ceny jsou prostý průměr čtvrthodin s cenou. Do 30. 9. 2025
+  jsou ceny OTE hodinové (v Kč), takže všechny 4 čtvrthodiny hodiny mají stejnou cenu a
+  průměr je přesně hodinová cena; od 1. 10. 2025 je to průměr čtyř 15minutových cen (v EUR
+  přepočtených kurzem ČNB) – stejně jako hodinový index OTE.
+- **Součty řádků se rovnají souhrnu** (ověřují testy; na skutečných datech červen–říjen
+  2026 do 0,005 Kč – hodnoty v JSON/CSV mají 6 desetinných míst, text 3).
+- **Přechod času:** hodina = čtvrthodiny jedné hodiny UTC, takže v den přechodu na zimní čas
+  je 25 řádků (02:00 CEST a 02:00 CET zvlášť, 100 čtvrthodin) a na letní čas 23 řádků (92
+  čtvrthodin).
+- Čtvrthodiny, kdy backtest neznal ceny, zůstanou jako řádky `no price` – kvůli měsíčním
+  poplatkům a souvislé řadě SoC.
+
+Ukázka (skutečné ceny OTE, 14. 10. 2026, 10 kWh / 5 kW, parametry z rychlého startu, bez
+měsíčních poplatků), výřez hodinového rozpisu:
+
+```text
+hour                  acts action                spot     buy    sell   bought     sold  SoC %    profit
+(local)                                       CZK/MWh CZK/kWh CZK/kWh      kWh      kWh    end       CZK
+2026-10-14 16:00 CEST ---- wait               3654.65   6.631   3.355    0.000    0.000   99.9     0.000
+2026-10-14 17:00 CEST ---- wait               5499.18  10.084   5.199    0.000    0.000   99.9     0.000
+2026-10-14 18:00 CEST ---D discharge          6620.78  11.441   6.321    0.000    1.250   86.8     8.862
+2026-10-14 19:00 CEST DDDD discharge          7198.73  12.141   6.899    0.000    5.000   34.0    34.494
+2026-10-14 20:00 CEST DD-- discharge          6576.03  11.387   6.276    0.000    2.281   10.0    15.219
+2026-10-14 21:00 CEST ---- wait               5837.77  10.494   5.538    0.000    0.000   10.0     0.000
+```
+
+a čtvrthodinového rozpisu kolem večerní špičky:
+
+```text
+quarter-hour               action                spot     buy    sell   bought     sold  SoC %    profit
+(local)                                       CZK/MWh CZK/kWh CZK/kWh      kWh      kWh    end       CZK
+2026-10-14 18:00 CEST      wait               6088.75  10.798   5.789    0.000    0.000   99.9     0.000
+2026-10-14 18:15 CEST      wait               6297.96  11.051   5.998    0.000    0.000   99.9     0.000
+2026-10-14 18:30 CEST      wait               6706.64  11.545   6.407    0.000    0.000   99.9     0.000
+2026-10-14 18:45 CEST      discharge          7389.79  12.372   7.090    0.000    1.250   86.8     8.862
+2026-10-14 19:00 CEST      discharge          6997.68  11.898   6.698    0.000    1.250   73.6     8.372
+2026-10-14 19:15 CEST      discharge          7232.95  12.182   6.933    0.000    1.250   60.4     8.666
+2026-10-14 19:30 CEST      discharge          7282.15  12.242   6.982    0.000    1.250   47.2     8.728
+2026-10-14 19:45 CEST      discharge          7282.15  12.242   6.982    0.000    1.250   34.0     8.728
+2026-10-14 20:00 CEST      discharge          7111.17  12.035   6.811    0.000    1.250   20.9     8.514
+2026-10-14 20:15 CEST      discharge          6801.38  11.660   6.501    0.000    1.031   10.0     6.705
+2026-10-14 20:30 CEST      wait               6306.00  11.061   6.006    0.000    0.000   10.0     0.000
+2026-10-14 20:45 CEST      wait               6085.58  10.794   5.786    0.000    0.000   10.0     0.000
+```
 
 ## Konfigurační soubor
 

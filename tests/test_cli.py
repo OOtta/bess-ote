@@ -5,6 +5,7 @@ import math
 import re
 import sys
 from datetime import date
+from itertools import pairwise
 
 import pytest
 
@@ -118,7 +119,7 @@ def test_monthly_fees_cli_backtest_and_plan(ote, tmp_path, capsys):
     rc, plain, _ = run([*argv, "--buy-vat", "21", "--json"], capsys)
     assert json.loads(plain)["summary"]["profit_czk"] == s["profit_czk"]
     assert json.loads(plain)["summary"]["fees_czk"] == 0
-    rc, out, _ = run([*argv, *fees, "--no-progress"], capsys)
+    rc, out, _ = run([*argv, *fees, "--no-progress", "-b", "month"], capsys)
     assert "Trading profit" in out and "Monthly fees" in out and "NET PROFIT" in out
     assert " fees " in out and " net " in out  # month breakdown columns
     csv_path = tmp_path / "bt.csv"
@@ -214,6 +215,110 @@ def test_jobs_option_same_json(ote, monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         main([*argv, "--jobs", "0"])
     assert exc.value.code == 2 and "--jobs" in capsys.readouterr().err
+
+
+SUM_KEYS = ("bought_kwh", "cost_czk", "sold_kwh", "revenue_czk", "wear_czk", "profit_czk",
+            "fees_czk", "net_profit_czk")  # fmt: skip
+FEES = ["--buy-vat", "21", "--buy-monthly-fee", "147", "--distribution-monthly-fee", "257"]
+
+
+def _check_totals(rows, summary, tol=0.01):
+    for k in SUM_KEYS:
+        assert sum(r[k] for r in rows) == pytest.approx(summary[k], abs=tol), k
+
+
+def test_breakdown_default_is_none(ote, capsys):
+    argv = ["backtest", *BAT, *TAR, "--from", "2025-06-01", "--to", "2025-06-02"]
+    rc, out, _ = run([*argv, "--json"], capsys)
+    assert rc == 0 and "breakdown" not in json.loads(out)
+    rc, out, _ = run([*argv, "--no-progress"], capsys)
+    assert "bought kWh" not in out and "(local)" not in out  # no table, summary only
+    rc, out, _ = run(["plan", *BAT, *TAR, "--at", "2025-06-10 12:00", "--json"], capsys)
+    assert "breakdown" not in json.loads(out)
+
+
+@pytest.mark.parametrize(
+    ("alias", "by", "n"),
+    [("hour", "hour", 3 * 24), ("h", "hour", 72), ("60min", "hour", 72),
+     ("quarter-hour", "quarter-hour", 3 * 96), ("qh", "quarter-hour", 288),
+     ("15min", "quarter-hour", 288), ("QUARTER", "quarter-hour", 288)],
+)  # fmt: skip
+def test_hour_and_quarter_breakdown_totals_equal_summary(ote, capsys, alias, by, n):
+    argv = ["backtest", *BAT, *TAR, *FEES, "--from", "2025-10-13", "--to", "2025-10-15"]
+    rc, out, _ = run([*argv, "-b", alias, "--json"], capsys)
+    assert rc == 0
+    doc = json.loads(out)
+    rows = doc["breakdown"]["rows"]
+    assert doc["breakdown"]["by"] == by and len(rows) == n
+    _check_totals(rows, doc["summary"])
+    assert rows[0]["period"] == "2025-10-13T00:00+02:00"
+    assert rows[0]["soc_start_pct"] == doc["soc_start_pct"]
+    assert rows[-1]["soc_end_pct"] == doc["soc_end_pct"]
+    for a, b in pairwise(rows):
+        assert a["soc_end_pct"] == b["soc_start_pct"]  # SoC chains row to row
+    if by == "quarter-hour":
+        ivs = json.loads(run([*argv, "--json"], capsys)[1])  # summary-only run
+        assert ivs["summary"] == doc["summary"]
+        assert {r["action"] for r in rows} <= {"charge", "discharge", "wait"}
+        assert all(len(r["pattern"]) == 1 and r["quarters"] == 1 for r in rows)
+    else:
+        assert all(r["quarters"] == 4 and len(r["pattern"]) == 4 for r in rows)
+
+
+def test_hourly_breakdown_text_and_csv(ote, tmp_path, capsys):
+    argv = ["backtest", *BAT, *TAR, "--from", "2025-06-01", "--to", "2025-06-01", "-b", "h"]
+    path = tmp_path / "hours.csv"
+    rc, out, _ = run([*argv, "--no-progress", "--breakdown-csv", str(path)], capsys)
+    assert rc == 0
+    assert "2025-06-01 00:00 CEST" in out and "2025-06-01 23:00 CEST" in out and "acts" in out
+    rows = list(csv.DictReader(path.open(encoding="utf-8")))
+    assert len(rows) == 24 and rows[0]["period"] == "2025-06-01T00:00+02:00"
+    # hourly-CZK era: the 4 quarters share the hourly price, so the average is that price
+    q = json.loads(run([*argv[:-1], "qh", "--json"], capsys)[1])["breakdown"]["rows"]
+    for h in (0, 5, 19):
+        four = {r["spot_czk_mwh"] for r in q[4 * h : 4 * h + 4]}
+        assert len(four) == 1 and float(rows[h]["spot_czk_mwh"]) == four.pop()
+    with pytest.raises(SystemExit):
+        main([*argv[:-1], "year"])
+    rc, _, err = run([*argv[:-2], "--breakdown-csv", str(path)], capsys)
+    assert rc == 2 and "needs a breakdown" in err
+
+
+@pytest.mark.parametrize(
+    ("day", "hours", "quarters"),
+    [("2025-10-26", 25, 100), ("2026-03-29", 23, 92), ("2025-03-30", 23, 92)],
+)  # fmt: skip
+def test_breakdown_on_dst_days(ote, capsys, day, hours, quarters):
+    argv = ["backtest", *BAT, *TAR, *FEES, "--from", day, "--to", day, "--json"]
+    h = json.loads(run([*argv, "-b", "hour"], capsys)[1])
+    q = json.loads(run([*argv, "-b", "qh"], capsys)[1])
+    assert len(h["breakdown"]["rows"]) == hours and len(q["breakdown"]["rows"]) == quarters
+    assert sum(r["quarters"] for r in h["breakdown"]["rows"]) == quarters
+    periods = [r["period"] for r in h["breakdown"]["rows"]]
+    assert len(set(periods)) == hours  # repeated 02:00 differs by its UTC offset
+    if hours == 25:
+        assert f"{day}T02:00+02:00" in periods and f"{day}T02:00+01:00" in periods
+    for doc in (h, q):
+        _check_totals(doc["breakdown"]["rows"], doc["summary"])
+
+
+def test_plan_hourly_breakdown(ote, tmp_path, capsys):
+    argv = ["plan", *BAT, *TAR, *FEES, "--at", "2025-10-14 09:10"]
+    rc, out, _ = run([*argv, "-b", "hour", "--json"], capsys)
+    doc = json.loads(out)
+    rows = doc["breakdown"]["rows"]
+    assert doc["breakdown"]["by"] == "hour" and len(doc["intervals"]) == 59  # 09:15 – 24:00
+    assert rows[0]["period"] == "2025-10-14T09:00+02:00" and rows[0]["quarters"] == 3
+    assert len(rows) == 15 and sum(r["quarters"] for r in rows) == 59
+    _check_totals(rows, doc["summary"])
+    path = tmp_path / "plan-hours.csv"
+    rc, out, _ = run([*argv, "-b", "hour", "--breakdown-csv", str(path)], capsys)
+    assert rc == 0 and "acts" in out and "2025-10-14 23:00 CEST" in out
+    assert len(list(csv.DictReader(path.open(encoding="utf-8")))) == 15
+    rc, out, _ = run([*argv, "-b", "qh", "--json"], capsys)
+    assert len(json.loads(out)["breakdown"]["rows"]) == 59
+    with pytest.raises(SystemExit):
+        main([*argv, "-b", "day"])  # plan covers at most ~1.5 days: hour / quarter-hour only
 
 
 def test_backtest_text_15min_era(ote, capsys):
