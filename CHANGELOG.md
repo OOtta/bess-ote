@@ -33,6 +33,8 @@ First version of **bess-ote** (BESS OTE kalkulačka).
   CSV/JSON; `plan` shows the fees for the horizon and the net result.
 - Backtest progress bar on stderr (percent, days processed, ETA; plain `\r`, ASCII, no
   dependency) – only when stderr is a terminal and without `--json`; `--no-progress` turns it
-  off.
+  off. With `--no-foresight` the rolling simulation fills the whole bar (60 / 40 split only
+  when the benchmark runs); the bar always ends at 100 % (also when the benchmark is skipped
+  because of gaps) and the ETA appears only once it is meaningful.
 - Czech README explains the negative-price modes for purchase and sale
   (`--buy-negative`, `--sell-negative`) with example tables.

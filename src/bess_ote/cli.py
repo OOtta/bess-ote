@@ -686,39 +686,58 @@ class ProgressBar:
     """Single-line progress on stderr (``\\r`` redraw, ASCII only – safe on Windows/Termux).
 
     Shown only when stderr is a terminal; stdout and exported files are never touched.
-    Rolling simulation and the perfect-foresight benchmark are weighted 60 / 40.
+    With the perfect-foresight benchmark the rolling simulation fills 0–60 % and the
+    benchmark 60–100 %; without it the simulation fills the whole bar. The final ``done``
+    event always draws 100 %.
     """
 
     WIDTH = 24
+    FORESIGHT_SHARE = 0.4
 
-    def __init__(self, stream: Any, foresight_share: float = 0.4) -> None:
+    def __init__(self, stream: Any, foresight: bool = True) -> None:
         self.stream = stream
-        self.share = foresight_share
+        self.share = self.FORESIGHT_SHARE if foresight else 0.0
         self.t0 = monotonic()
-        self.last = 0.0
+        self.last = -1.0
+        self.overall = 0.0  # last drawn fraction (never decreases)
         self.shown = False
 
     @classmethod
-    def create(cls, *, enabled: bool) -> ProgressBar | None:
+    def create(cls, *, enabled: bool, foresight: bool = True) -> ProgressBar | None:
         stream = sys.stderr
         if not enabled or stream is None or not getattr(stream, "isatty", lambda: False)():
             return None
-        return cls(stream)
+        return cls(stream, foresight)
+
+    def _overall(self, phase: str, fraction: float) -> float:
+        fraction = min(max(fraction, 0.0), 1.0)
+        if phase == "done":
+            return 1.0
+        if phase == "foresight":
+            return 1 - self.share + fraction * self.share
+        return fraction * (1 - self.share)
+
+    def eta_text(self, overall: float, elapsed: float) -> str:
+        if overall >= 1:
+            return "ETA 0:00"
+        if overall < 0.03 or elapsed < 0.5:  # too early for a meaningful estimate
+            return "ETA --:--"
+        eta = round(elapsed / overall * (1 - overall))
+        return f"ETA {eta // 60}:{eta % 60:02d}"
 
     def update(self, phase: str, fraction: float, detail: str) -> None:
-        overall = fraction * (1 - self.share) if phase == "simulate" else (
-            1 - self.share + fraction * self.share
-        )  # fmt: skip
+        overall = max(self.overall, self._overall(phase, fraction))
         now = monotonic()
-        if now - self.last < 0.1 and fraction < 1:
-            return
+        if fraction < 1 and phase != "done" and now - self.last < 0.1:
+            return  # throttled; phase ends and the final "done" are always drawn
         self.last = now
-        elapsed = now - self.t0
-        eta = elapsed / overall * (1 - overall) if overall > 0.02 else None
+        self.overall = overall
         filled = int(self.WIDTH * overall)
         bar = "#" * filled + "-" * (self.WIDTH - filled)
-        eta_txt = f"ETA {int(eta) // 60}:{int(eta) % 60:02d}" if eta is not None else "ETA --:--"
-        line = f"\r[{bar}] {overall * 100:5.1f} %  {detail:<18} {eta_txt}"
+        line = (
+            f"\r[{bar}] {overall * 100:5.1f} %  {detail:<18} "
+            f"{self.eta_text(overall, now - self.t0)}"
+        )
         with contextlib.suppress(OSError, ValueError):
             self.stream.write(line)
             self.stream.flush()
@@ -816,7 +835,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     # one extra day: on the last day the next day's prices are published at ~13:05
     book = fetch_book(ote_client(args), start, min(end + timedelta(days=1), today))
     info(f"Simulating {start} – {end} ...")
-    bar = ProgressBar.create(enabled=not (args.json or args.no_progress))
+    bar = ProgressBar.create(
+        enabled=not (args.json or args.no_progress), foresight=not args.no_foresight
+    )
     try:
         res = run_backtest(book, start, end, tariffs, b, tcfg, soc, publish=pub,
                            foresight=not args.no_foresight,

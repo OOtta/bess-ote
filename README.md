@@ -217,7 +217,9 @@ ukazuje na stderr jednoduchý řádek s procenty, počtem zpracovaných dní a o
 závislostí) a po skončení se smaže. Zobrazí se **jen když je stderr terminál** a není zadáno
 `--json` – při přesměrování do souboru, v rouře nebo cronu se nic nevypisuje. Standardní
 výstup ani soubor z `-o` neovlivní. Vypnout jde volbou `--no-progress`. Se srovnáním
-s ideálem připadá zhruba 60 % pruhu na klouzavou simulaci a 40 % na výpočet ideálu.
+s ideálem připadá zhruba 60 % pruhu na klouzavou simulaci a 40 % na výpočet ideálu,
+s `--no-foresight` celý pruh na simulaci. Po dokončení pruh vždy ukáže 100 %; odhad
+zbývajícího času se zobrazí až po prvních procentech výpočtu.
 
 ## Jak se počítá cena
 

@@ -128,7 +128,11 @@ def run_backtest(
     foresight: bool = True,
     progress: Callable[[str, float, str], None] | None = None,
 ) -> BacktestResult:
-    """``progress(phase, fraction 0..1, detail)`` is called while simulating."""
+    """``progress(phase, fraction 0..1, detail)`` is called while simulating.
+
+    Phases: ``simulate`` (rolling plan), ``foresight`` (benchmark, only if it runs) and a
+    final ``done`` with fraction 1.0, always emitted on success.
+    """
     if tcfg.mode == "min-soc" and tcfg.min_soc_pct is None:
         tcfg = TerminalConfig("min-soc", None, battery.pct(initial_soc_kwh))
     t = local_midnight_utc(start)
@@ -219,4 +223,6 @@ def run_backtest(
             res.foresight_end_soc_kwh = steps[-1].soc_kwh if steps else snapped_initial
         else:
             warnings.append("Perfect-foresight benchmark skipped: the period has gaps.")
+    if progress is not None:
+        progress("done", 1.0, f"{n_days}/{n_days} days")
     return res

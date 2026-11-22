@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import math
+import re
 import sys
 from datetime import date
 
@@ -157,6 +158,53 @@ def test_backtest_progress_bar_only_on_tty(ote, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "stderr", io.StringIO())  # not a terminal → no bar
     assert main(argv) == 0
     assert "\r[" not in sys.stderr.getvalue()
+
+
+def _bar_percents(text):
+    return [float(m) for m in re.findall(r"\] +([0-9.]+) %", text)]
+
+
+@pytest.mark.parametrize("foresight", [True, False])
+def test_progress_bar_ends_at_100_in_both_modes(ote, monkeypatch, capsys, foresight):
+    argv = ["backtest", *BAT, "--from", "2025-06-01", "--to", "2025-06-03"]
+    if not foresight:
+        argv.append("--no-foresight")
+    main([*argv, "--json"])  # warm the cache
+    capsys.readouterr()
+    tty = FakeTty()
+    monkeypatch.setattr(sys, "stderr", tty)
+    assert main(argv) == 0
+    bar = tty.getvalue()
+    pct = _bar_percents(bar)
+    assert pct[-1] == 100.0  # final reported fraction == 1.0
+    assert pct == sorted(pct)  # never goes backwards
+    assert ("perfect foresight" in bar) is foresight
+    last = bar.split("\r[")[-1]
+    assert "ETA 0:00" in last
+    if not foresight:
+        assert "3/3 days" in last  # simulation alone fills the bar, no stop at 60 %
+        assert "60.0 %" not in bar.replace("100.0 %", "")
+
+
+def test_progress_bar_mapping_and_eta():
+    from bess_ote.cli import ProgressBar
+
+    with_f, without = ProgressBar(FakeTty(), True), ProgressBar(FakeTty(), False)
+    assert with_f._overall("simulate", 1.0) == pytest.approx(0.6)
+    assert with_f._overall("foresight", 0.5) == pytest.approx(0.8)
+    assert without._overall("simulate", 1.0) == 1.0
+    assert without._overall("simulate", 0.25) == 0.25
+    assert with_f._overall("done", 0.0) == without._overall("done", 0.0) == 1.0
+    assert without.eta_text(0.01, 5.0) == "ETA --:--"  # too early
+    assert without.eta_text(0.5, 0.1) == "ETA --:--"
+    assert without.eta_text(0.5, 30.0) == "ETA 0:30"
+    assert without.eta_text(0.25, 60.0) == "ETA 3:00"
+    assert without.eta_text(1.0, 60.0) == "ETA 0:00"
+    # throttled updates never skip the final 100 %
+    without.update("simulate", 0.1, "1/3 days")
+    without.update("simulate", 0.5, "2/3 days")
+    without.update("done", 1.0, "3/3 days")
+    assert without.overall == 1.0 and "100.0 %" in without.stream.getvalue()
 
 
 def test_backtest_text_15min_era(ote, capsys):

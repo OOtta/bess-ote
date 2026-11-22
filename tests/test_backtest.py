@@ -123,12 +123,35 @@ def test_monthly_fees_prorated_by_days_and_do_not_change_decisions():
     assert fees.fees_for_day(d) == pytest.approx(monthly / 31)
 
 
-def test_progress_callback_reaches_100_percent():
+@pytest.mark.parametrize("foresight", [True, False])
+def test_progress_callback_reaches_100_percent(foresight):
     book = synthetic_book(date(2026, 6, 1), 4)
     seen = []
     run_backtest(book, date(2026, 6, 1), date(2026, 6, 3), T, B, TerminalConfig(), 1.0,
+                 foresight=foresight,
                  progress=lambda ph, f, det: seen.append((ph, f, det)))  # fmt: skip
     sim = [s for s in seen if s[0] == "simulate"]
     assert sim[0][1] == 0 and sim[-1][1] == 1.0 and sim[-1][2] == "3/3 days"
     assert all(a[1] <= b[1] for a, b in pairwise(sim))
-    assert any(s[0] == "foresight" for s in seen)
+    assert any(s[0] == "foresight" for s in seen) is foresight
+    assert seen[-1] == ("done", 1.0, "3/3 days")  # final reported fraction == 1.0
+
+
+def test_progress_done_when_foresight_skipped_for_gaps():
+    book = synthetic_book(date(2025, 9, 28), 6, hourly=True)
+    a, b = local_midnight_utc(date(2025, 9, 30)), local_midnight_utc(date(2025, 10, 1))
+    for t in [t for t in book.spot if a <= t < b]:
+        del book.spot[t]
+    del book.resolution[date(2025, 9, 30)]
+    seen = []
+    res = run_backtest(book, date(2025, 9, 28), date(2025, 10, 1), T, B, TerminalConfig(), 1.0,
+                       progress=lambda ph, f, det: seen.append((ph, f)))  # fmt: skip
+    assert res.foresight is None and seen[-1] == ("done", 1.0)
+
+
+def test_single_day_progress():
+    book = synthetic_book(date(2026, 6, 1), 2)
+    seen = []
+    run_backtest(book, date(2026, 6, 1), date(2026, 6, 1), T, B, TerminalConfig(), 1.0,
+                 progress=lambda ph, f, det: seen.append((ph, f)))  # fmt: skip
+    assert seen[0] == ("simulate", 0.0) and seen[-1] == ("done", 1.0)
