@@ -1,0 +1,44 @@
+# bess-ote configuration – copy to ~/.config/bess-ote/config.toml
+# (Windows: %APPDATA%\bess-ote\config.toml). Command-line flags override these values.
+
+[battery]
+capacity_kwh = 10            # usable capacity
+charge_kw = 5                # max charging power (AC)
+# discharge_kw = 5           # default = charge_kw
+efficiency = 90              # round trip in %
+# charge_efficiency = 95     # or separately (%)
+# discharge_efficiency = 95
+soc_min = 10                 # %
+soc_max = 100                # %
+# soc = 10                   # current / initial SoC in % (default = soc_min)
+# cycle_cost_czk_kwh = 0     # wear per kWh discharged to the grid
+# terminal = "value"         # value | zero | min-soc
+# terminal_price_czk_kwh = 3.5
+# terminal_soc = 50
+# soc_step_kwh = 0.025
+
+[buy]                        # purchase: spot × multiplier + add_czk_mwh
+multiplier = 1.0
+add_czk_mwh = 400
+# negative_multiplier = 1.0
+# negative_add_czk_mwh = 0
+# negative = "as-is"         # as-is | clamp-spot | clamp-total
+vat = 21                     # % on energy + distribution + fees
+
+[sell]                       # sale: spot × multiplier + add_czk_mwh
+multiplier = 1.0
+add_czk_mwh = -300           # supplier fee
+# vat = 0                    # VAT payers only
+
+[distribution]               # CZK/kWh excl. VAT, purchased energy only (example values!)
+high_czk_kwh = 2.435
+low_czk_kwh = 0.416
+# other_czk_kwh = 0.6        # system services, POZE, electricity tax …
+
+[low_tariff]
+hours = "1:15-5:15,12:30-16:30"
+hours_weekend = "2:45-6:45,13:00-17:00"
+holidays = "weekend"         # weekday | weekend
+
+[market]
+# publish_time = "13:05"     # default: 12:57 until 2025-09-30, 13:05 from 2025-10-01
