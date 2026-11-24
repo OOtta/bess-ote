@@ -44,3 +44,11 @@ holidays = "weekend"         # weekday | weekend
 
 [market]
 # publish_time = "13:05"     # default: 12:57 until 2025-09-30, 13:05 from 2025-10-01
+
+# [pv]                       # solar PV – keep your real location only in your local config!
+# lat = 50.0755              # generic Prague point
+# lon = 14.4378
+# arrays = [[0, 35, 5]]      # [azimuth (0 = south, -90 = east), tilt, kWp], repeat for more
+# losses = 14                # %
+# inverter_kw = 5            # shared AC limit PV + battery; default max(charge, discharge)
+# replan = "forecast"        # backtest: publication | forecast | quarter

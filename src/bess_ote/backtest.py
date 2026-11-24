@@ -8,6 +8,14 @@ charge is carried on. Because the DP decision at ``t`` depends only on the inter
 was published) and otherwise reused – the decisions are bit-for-bit those of ``plan --at t``.
 
 The perfect-foresight benchmark solves the whole period at once with all prices known.
+
+With PV (:class:`PvSetup`) each re-optimisation uses the PV forecast known at its moment and
+every quarter-hour is settled on the actual production. ``replan`` decides when the plan is
+recomputed besides price publications: ``publication`` (only then, on the forecast known at
+that moment), ``forecast`` (also whenever a newer forecast run is available) or ``quarter``
+(every quarter-hour: newest forecast, the last quarter's actual/forecast ratio applied to the
+next quarters and fading out over :data:`NOWCAST_QUARTERS`). The perfect-foresight benchmark
+uses the actual production.
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, BrokenExecutor, wait
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -41,6 +49,27 @@ from bess_ote.planner import Problem, TerminalConfig, terminal_for
 from bess_ote.tariff import Tariffs
 from bess_ote.timeutil import QUARTER, local_midnight_utc, to_local
 
+REPLAN_MODES = ("publication", "forecast", "quarter")
+#: quarter mode: the actual/forecast ratio of the last quarter fades out over this many quarters
+NOWCAST_QUARTERS = 8
+NOWCAST_MAX_RATIO = 3.0
+#: … and is used only when the forecast for that quarter was at least this many kWh per kWp
+NOWCAST_MIN_KWH_PER_KWP = 0.01
+
+
+class PvSource(Protocol):
+    def at(self, at: datetime, starts: list[datetime]) -> tuple[list[float], Any]:
+        """PV forecast (kWh per quarter-hour) for ``starts`` as known at ``at``."""
+        ...
+
+
+@dataclass
+class PvSetup:
+    forecast: PvSource
+    actual: dict[datetime, float]  # measured kWh per quarter start (missing → forecast then)
+    kwp: float
+    replan: str = "forecast"
+
 
 @dataclass
 class Interval:
@@ -50,6 +79,7 @@ class Interval:
     sell_czk_kwh: float
     step: Step
     horizon_end: datetime
+    pv_forecast_kwh: float | None = None  # PV the decision was based on
 
 
 @dataclass
@@ -62,6 +92,14 @@ class Totals:
     discharged_kwh: float = 0.0  # from storage (before discharge losses)
     intervals: int = 0
     fees_czk: float = 0.0  # prorated monthly fees (incl. VAT)
+    pv: bool = False  # report the PV fields
+    pv_kwh: float = 0.0  # actual production
+    pv_forecast_kwh: float = 0.0  # forecast the decisions were based on
+    pv_abs_error_kwh: float = 0.0
+    pv_battery_kwh: float = 0.0
+    pv_grid_kwh: float = 0.0
+    pv_curtailed_kwh: float = 0.0
+    pv_revenue_czk: float = 0.0  # PV sold directly to the grid
 
     def add(self, iv: Interval) -> None:
         st = iv.step
@@ -72,8 +110,18 @@ class Totals:
         elif st.grid_kwh < 0:
             self.sold_kwh += -st.grid_kwh
             self.revenue_czk += st.cash_czk
+        if st.delta_kwh < 0:
             self.discharged_kwh += -st.delta_kwh
         self.wear_czk += st.wear_czk
+        if self.pv:
+            fc = st.pv_kwh if iv.pv_forecast_kwh is None else iv.pv_forecast_kwh
+            self.pv_kwh += st.pv_kwh
+            self.pv_forecast_kwh += fc
+            self.pv_abs_error_kwh += abs(fc - st.pv_kwh)
+            self.pv_battery_kwh += st.pv_battery_kwh
+            self.pv_grid_kwh += st.pv_grid_kwh
+            self.pv_curtailed_kwh += st.pv_curtailed_kwh
+            self.pv_revenue_czk += st.pv_grid_kwh * iv.sell_czk_kwh
 
     @property
     def profit_czk(self) -> float:
@@ -95,7 +143,21 @@ class Totals:
             "fees_czk": round(self.fees_czk, 2),
             "net_profit_czk": round(self.net_profit_czk, 2),
             "cycles": round(self.discharged_kwh / usable_kwh, 3) if usable_kwh else 0.0,
-        }
+        } | (self.pv_dict() if self.pv else {})
+
+    def pv_dict(self) -> dict[str, float | None]:
+        act = self.pv_kwh
+        return {
+            "pv_kwh": round(act, 4),
+            "pv_forecast_kwh": round(self.pv_forecast_kwh, 4),
+            "pv_forecast_bias_pct": round((self.pv_forecast_kwh - act) / act * 100, 2)
+            if act else None,
+            "pv_forecast_mae_pct": round(self.pv_abs_error_kwh / act * 100, 2) if act else None,
+            "pv_battery_kwh": round(self.pv_battery_kwh, 4),
+            "pv_grid_kwh": round(self.pv_grid_kwh, 4),
+            "pv_curtailed_kwh": round(self.pv_curtailed_kwh, 4),
+            "pv_revenue_czk": round(self.pv_revenue_czk, 2),
+        }  # fmt: skip
 
 
 @dataclass
@@ -116,6 +178,7 @@ class BacktestResult:
     fees_by_day: dict[date, float] = field(default_factory=dict)
     workers: int = 1  # worker processes used for the DP solves (1 = serial)
     tariffs: Tariffs | None = None
+    pv: dict[str, Any] | None = None  # PV settings / statistics (None = no PV)
 
     def quarters(self) -> list[Quarter]:
         """Every quarter-hour of the period, skipped ones (no price) as idle quarters."""
@@ -136,7 +199,7 @@ class BacktestResult:
                 out.append(Quarter(t, math.nan, math.nan, math.nan, None, soc, *extra(t)))
             else:
                 out.append(Quarter(t, iv.spot_czk_mwh, iv.buy_czk_kwh, iv.sell_czk_kwh, iv.step,
-                                   soc, *extra(t)))  # fmt: skip
+                                   soc, *extra(t), pv_forecast_kwh=iv.pv_forecast_kwh))  # fmt: skip
                 soc = iv.step.soc_kwh
             t += QUARTER
         return out
@@ -146,7 +209,8 @@ class BacktestResult:
         :mod:`bess_ote.breakdown`)."""
         if by in FINE:
             return fine_rows(self.quarters(), self.battery, by)
-        groups: dict[str, Totals] = defaultdict(Totals)
+        has_pv = self.pv is not None
+        groups: dict[str, Totals] = defaultdict(lambda: Totals(pv=has_pv))
 
         def key(d: date) -> str:
             return d.isoformat() if by == "day" else f"{d.year:04d}-{d.month:02d}"
@@ -187,11 +251,12 @@ class _PeriodPrices:
             dtype=float,
         )
 
-    def problem(self, starts: list[datetime], terminal: Terminal) -> Problem:
+    def problem(self, starts: list[datetime], terminal: Terminal,
+                pv: np.ndarray | None = None) -> Problem:  # fmt: skip
         i = self.index[starts[0]]
         j = i + len(starts)
         assert self.starts[i:j] == starts, "horizon is not contiguous in the price book"
-        return Problem(starts, self.spot[i:j], self.buy[i:j], self.sell[i:j], terminal)
+        return Problem(starts, self.spot[i:j], self.buy[i:j], self.sell[i:j], terminal, pv)
 
 
 def run_backtest(
@@ -207,6 +272,7 @@ def run_backtest(
     foresight: bool = True,
     progress: Callable[[str, float, str], None] | None = None,
     jobs: int | None = 1,
+    pv: PvSetup | None = None,
 ) -> BacktestResult:
     """Rolling backtest.
 
@@ -228,17 +294,45 @@ def run_backtest(
     report = progress or (lambda *_: None)
     report("simulate", 0.0, f"0/{n_days} days")
 
-    # 1) schedule – which quarter is decided by which re-optimisation (independent of SoC)
+    if pv is not None and pv.replan not in REPLAN_MODES:
+        raise ValueError(f"replan must be one of {', '.join(REPLAN_MODES)}")
+
+    def pv_vector(t: datetime, starts: list[datetime]) -> np.ndarray:
+        """PV forecast for ``starts`` as known at ``t`` (+ the nowcast in quarter mode)."""
+        assert pv is not None
+        vals, _ = pv.forecast.at(t, starts)
+        if pv.replan == "quarter":
+            prev = t - QUARTER
+            act = pv.actual.get(prev)
+            if act is not None:
+                fc = pv.forecast.at(t, [prev])[0][0]
+                if fc >= NOWCAST_MIN_KWH_PER_KWP * pv.kwp:
+                    r = min(max(act / fc, 0.0), NOWCAST_MAX_RATIO)
+                    vals = [v * (1 + (r - 1) * max(0.0, 1 - k / NOWCAST_QUARTERS))
+                            for k, v in enumerate(vals)]  # fmt: skip
+        return np.asarray(vals, dtype=float)
+
+    # 1) schedule – which quarter is decided by which re-optimisation (independent of SoC);
+    #    with PV also a new one whenever the PV forecast for the rest of the horizon changes
     plan_q: list[tuple[datetime, int, int]] = []  # (t, event index or -1 = skipped, offset)
-    ev_spans: list[tuple[datetime, datetime]] = []  # (first start, last start)
+    ev_spans: list[tuple[datetime, datetime, np.ndarray | None]] = []  # (first, last, PV)
     t = t0
     while t < t_end:
         last = book.horizon_end(t, t, publish)
         if last is None:
             plan_q.append((t, -1, 0))
         else:
-            if not ev_spans or ev_spans[-1][1] != last or t > last:
-                ev_spans.append((t, last))
+            new = not ev_spans or ev_spans[-1][1] != last or t > last
+            vec = None
+            if pv is not None and (new or pv.replan != "publication"):
+                n_h = (last - t) // QUARTER + 1
+                vec = pv_vector(t, [t + i * QUARTER for i in range(n_h)])
+                if not new:
+                    first, _, cur = ev_spans[-1]
+                    assert cur is not None
+                    new = not np.array_equal(cur[(t - first) // QUARTER :], vec)
+            if new:
+                ev_spans.append((t, last, vec))
             e_t = ev_spans[-1][0]
             plan_q.append((t, len(ev_spans) - 1, (t - e_t) // QUARTER))
         t += QUARTER
@@ -247,16 +341,25 @@ def run_backtest(
     prices = _PeriodPrices(book, tariffs)
     by_day = book.values_by_day()
     events: list[_Event] = []
-    for first, last in ev_spans:
+    for first, last, vec in ev_spans:
         n = (last - first) // QUARTER + 1
         starts = [first + i * QUARTER for i in range(n)]
         term = terminal_for(book, starts, tariffs, battery, tcfg, initial_soc_kwh, by_day)
-        events.append(_Event(prices.problem(starts, term)))
+        events.append(_Event(prices.problem(starts, term, vec)))
     for _, e, off in plan_q:
         if e >= 0:
             events[e].keep = max(events[e].keep, off + 1)
     intervals_starts = [t for t, e, _ in plan_q if e >= 0]
     terminal_value = events[-1].prob.terminal.czk_per_kwh_stored if events else 0.0
+    actual: dict[datetime, float] = {}
+    missing_actual = 0
+    if pv is not None:  # settlement values; a missing measurement → the forecast known then
+        for t in intervals_starts:
+            v = pv.actual.get(t)
+            if v is None:
+                missing_actual += 1
+                v = pv.forecast.at(t, [t])[0][0]
+            actual[t] = v
 
     fprob: Problem | None = None
     fterminal: Terminal | None = None
@@ -267,7 +370,8 @@ def run_backtest(
                                      initial_soc_kwh, by_day)  # fmt: skip
             if fterminal.mode == "value":  # same valuation as the report → a true upper bound
                 fterminal = Terminal("value", czk_per_kwh_stored=terminal_value)
-            fprob = prices.problem(intervals_starts, fterminal)
+            fpv = None if pv is None else np.array([actual[t] for t in intervals_starts])
+            fprob = prices.problem(intervals_starts, fterminal, fpv)
         else:
             warnings.append("Perfect-foresight benchmark skipped: the period has gaps.")
 
@@ -281,22 +385,24 @@ def run_backtest(
 
     # 4) forward pass: carry the state of charge through the decision tables (sequential)
     sols = [
-        Solution(battery, levels, deltas, ev.choice, np.empty(0), ev.prob.buy, ev.prob.sell, k0)
+        Solution(battery, levels, deltas, ev.choice, np.empty(0), ev.prob.buy, ev.prob.sell, k0,
+                 pv=ev.prob.pv)
         for ev in events
     ]  # fmt: skip
     state = sols[0].state_index(initial_soc_kwh) if sols else None
     snapped_initial = float(levels[state]) if state is not None else initial_soc_kwh
     intervals: list[Interval] = []
-    totals = Totals()
+    totals = Totals(pv=pv is not None)
     skipped = 0
     for t, e, off in plan_q:
         if e < 0:
             skipped += 1
             continue
         prob = events[e].prob
-        st, state = step_at(sols[e], off, state)
+        st, state = step_at(sols[e], off, state, actual[t] if pv is not None else None)
         iv = Interval(t, float(prob.spot[off]), float(prob.buy[off]), float(prob.sell[off]),
-                      st, prob.starts[-1] + QUARTER)  # fmt: skip
+                      st, prob.starts[-1] + QUARTER,
+                      None if prob.pv is None else float(prob.pv[off]))  # fmt: skip
         intervals.append(iv)
         totals.add(iv)
     if skipped:
@@ -314,11 +420,29 @@ def run_backtest(
         res.fees_by_day[d] = tariffs.fees_for_day(d)
         d += timedelta(days=1)
     res.totals.fees_czk = sum(res.fees_by_day.values())
+    if pv is not None:
+        if missing_actual:
+            warnings.append(f"{missing_actual} quarter-hour(s) without a ČHMÚ measurement were "
+                            "settled on the PV forecast known then.")  # fmt: skip
+        days_fc: dict[date, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        for iv in intervals:
+            acc = days_fc[to_local(iv.start).date()]
+            acc[0] += iv.pv_forecast_kwh or 0.0
+            acc[1] += iv.step.pv_kwh
+        act_days = sum(a for _, a in days_fc.values())
+        res.pv = {
+            "replan": pv.replan, "kwp": pv.kwp, "inverter_kw": battery.inverter_kw,
+            "events": len(events), "missing_actual": missing_actual,
+            "daily_mae_pct": round(sum(abs(f - a) for f, a in days_fc.values()) / act_days * 100,
+                                   2) if act_days else None,
+        }  # fmt: skip
     if fsteps is not None:
-        ft = Totals()
+        ft = Totals(pv=pv is not None)
         steps = fsteps
+        assert fprob is not None
         for i, s in enumerate(steps):
-            ft.add(Interval(intervals_starts[i], math.nan, 0, 0, s, intervals_starts[-1]))
+            ft.add(Interval(intervals_starts[i], math.nan, float(fprob.buy[i]),
+                            float(fprob.sell[i]), s, intervals_starts[-1]))  # fmt: skip
         ft.fees_czk = res.totals.fees_czk
         res.foresight = ft
         res.foresight_end_soc_kwh = steps[-1].soc_kwh if steps else snapped_initial
@@ -364,7 +488,8 @@ def _solve_all(
             with lock:
                 state["f"] = f
 
-        steps = solve_rollout(battery, fprob.buy, fprob.sell, fprob.terminal, snapped_initial, cb)
+        steps = solve_rollout(battery, fprob.buy, fprob.sell, fprob.terminal, snapped_initial, cb,
+                              pv=fprob.pv)  # fmt: skip
         with lock:
             state["f"] = 1.0
         return steps
@@ -372,7 +497,7 @@ def _solve_all(
     def serial(todo: list[_Event]) -> None:
         for ev in todo:
             p = ev.prob
-            ev.choice = solve_choice(battery, p.buy, p.sell, p.terminal, ev.keep)
+            ev.choice = solve_choice(battery, p.buy, p.sell, p.terminal, ev.keep, p.pv)
             finished(ev)
             emit()
 
@@ -391,7 +516,7 @@ def _solve_all(
             order = sorted(events, key=lambda ev: -len(ev.prob.starts))
             futs = {
                 pool.submit(solve_choice, battery, ev.prob.buy, ev.prob.sell, ev.prob.terminal,
-                            ev.keep): ev
+                            ev.keep, ev.prob.pv): ev
                 for ev in order
             }  # fmt: skip
             if fprob is not None:

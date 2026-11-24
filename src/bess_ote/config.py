@@ -28,6 +28,7 @@ KNOWN: dict[str, set[str]] = {
     "distribution": {"high_czk_kwh", "low_czk_kwh", "other_czk_kwh", "monthly_fee"},
     "low_tariff": {"hours", "hours_weekend", "holidays"},
     "market": {"publish_time"},
+    "pv": {"lat", "lon", "arrays", "losses", "inverter_kw", "replan"},
 }  # fmt: skip
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
@@ -37,6 +38,7 @@ class Problem:
     buy: np.ndarray
     sell: np.ndarray
     terminal: Terminal
+    pv: np.ndarray | None = None  # PV forecast kWh per quarter-hour (None = no PV)
 
 
 def build_problem(
@@ -50,6 +52,7 @@ def build_problem(
     publish: time | None = None,
     initial_soc_kwh: float | None = None,
     horizon: list[datetime] | None = None,
+    pv: Callable[[list[datetime]], list[float]] | None = None,
 ) -> Problem:
     starts = horizon if horizon is not None else book.horizon(start, at, publish)
     spot = np.array([book.spot[t] for t in starts], dtype=float)
@@ -61,8 +64,9 @@ def build_problem(
     sell = np.array(
         [tariffs.sell_czk_kwh(s) if not math.isnan(s) else math.nan for s in spot], dtype=float
     )
+    pv_arr = None if pv is None else np.asarray(pv(starts), dtype=float)
     return Problem(starts, spot, buy, sell, terminal_for(book, starts, tariffs, battery, tcfg,
-                                                         initial_soc_kwh))  # fmt: skip
+                                                         initial_soc_kwh), pv_arr)  # fmt: skip
 
 
 def terminal_for(
@@ -121,19 +125,21 @@ def plan(
     *,
     publish: time | None = None,
     use_publication_rule: bool = True,
+    pv: Callable[[list[datetime]], list[float]] | None = None,
 ) -> PlanResult:
     """Optimal schedule from the first quarter-hour boundary at/after ``at`` until the end of
     the prices known at ``at`` (publication rule) – or all prices in ``book`` when
     ``use_publication_rule`` is False (live data: the book holds exactly what OTE published).
+    ``pv(starts)`` = PV forecast (kWh per quarter-hour) known at ``at``.
     """
     from bess_ote.market import ceil_quarter
 
     start = ceil_quarter(at)
     prob = build_problem(
         book, start, at if use_publication_rule else None, tariffs, battery, tcfg,
-        publish=publish, initial_soc_kwh=soc_kwh,
+        publish=publish, initial_soc_kwh=soc_kwh, pv=pv,
     )  # fmt: skip
-    sol = solve(battery, prob.buy, prob.sell, prob.terminal)
+    sol = solve(battery, prob.buy, prob.sell, prob.terminal, pv=prob.pv)
     state = sol.state_index(soc_kwh)
     snapped = float(sol.levels[state])
     return PlanResult(at, start, prob, sol, rollout(sol, snapped), snapped)

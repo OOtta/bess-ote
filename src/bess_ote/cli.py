@@ -8,13 +8,14 @@ import csv
 import json
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any
 
 from bess_ote import __version__
-from bess_ote.backtest import BacktestResult, run_backtest
+from bess_ote.backtest import REPLAN_MODES, BacktestResult, PvSetup, run_backtest
 from bess_ote.battery import DT_H, Battery, BatteryError
 from bess_ote.breakdown import FINE, Quarter, fine_rows, normalise
 from bess_ote.cache import JsonCache, default_cache_dir
@@ -25,8 +26,17 @@ from bess_ote.lowtariff import LowTariffError, LowTariffSchedule
 from bess_ote.market import PriceBook, ceil_quarter, default_publish_time
 from bess_ote.ote import OteClient
 from bess_ote.planner import PlanResult, TerminalConfig, plan
+from bess_ote.pv import PvArray, PvError, PvSystem
+from bess_ote.pvdata import Chmi, OpenMeteo, PvForecast, Run, runs_between
 from bess_ote.tariff import Distribution, SpotFormula, Tariffs
-from bess_ote.timeutil import PRAGUE, QUARTER, local_date, local_today, to_local
+from bess_ote.timeutil import (
+    PRAGUE,
+    QUARTER,
+    local_date,
+    local_midnight_utc,
+    local_today,
+    to_local,
+)
 
 
 class CliError(Exception):
@@ -273,6 +283,26 @@ def common_parser() -> argparse.ArgumentParser:
         help="public holidays use their weekday (default) or the weekend windows",
     )
 
+    v = p.add_argument_group("PV plant (photovoltaics; location stays in your local config)")
+    v.add_argument(
+        "--pv-array",
+        action="append",
+        metavar="AZ,TILT,KWP",
+        help="PV array: azimuth ° (0 = south, −90 = east, 90 = west), tilt ° (0 = flat), kWp; "
+        "repeat for more arrays, e.g. --pv-array 0,35,5 --pv-array=-90,20,2 "
+        "(use = when the value starts with −)",
+    )
+    v.add_argument("--lat", type=float, metavar="DEG", help="PV location latitude")
+    v.add_argument("--lon", type=float, metavar="DEG", help="PV location longitude")
+    v.add_argument("--pv-losses", type=float, metavar="PCT", help="system losses %% (default 14)")
+    v.add_argument(
+        "--inverter-kw",
+        type=float,
+        metavar="KW",
+        help="shared hybrid-inverter AC limit for grid import and export (PV + battery); "
+        "default with PV = max(--power, --discharge-power)",
+    )
+
     g = p.add_argument_group("general")
     g.add_argument(
         "--publish-time",
@@ -368,6 +398,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-foresight", action="store_true", help="skip the perfect-foresight benchmark"
     )
     bt.add_argument(
+        "--replan",
+        choices=REPLAN_MODES,
+        help="with PV: re-plan only at OTE publications (publication), also at every new "
+        "forecast run (forecast, default) or every quarter-hour using the actual production "
+        "(quarter)",
+    )
+    bt.add_argument(
         "-j",
         "--jobs",
         type=_jobs,
@@ -406,6 +443,43 @@ def _num(v: Any, what: str) -> float:
         raise CliError(f"{what} must be a number, got {v!r}") from exc
 
 
+def pv_arrays(args: argparse.Namespace, cfg: Config) -> tuple[PvArray, ...]:
+    try:
+        if getattr(args, "pv_array", None):
+            return tuple(PvArray.parse(a) for a in args.pv_array)
+        raw = cfg.get("pv", "arrays") or []
+        out = []
+        for a in raw:
+            if isinstance(a, dict):
+                out.append(PvArray(float(a["azimuth"]), float(a["tilt"]), float(a["kwp"])))
+            elif isinstance(a, (list, tuple)) and len(a) == 3:
+                out.append(PvArray(*map(float, a)))
+            else:
+                raise PvError(f"[pv] arrays: use [azimuth, tilt, kwp] or tables, got {a!r}")
+        return tuple(out)
+    except (PvError, KeyError, TypeError, ValueError) as exc:
+        raise CliError(f"PV: {exc}") from exc
+
+
+def build_pv(args: argparse.Namespace, cfg: Config) -> PvSystem | None:
+    arrays = pv_arrays(args, cfg)
+    if not arrays:
+        return None
+    lat, lon = _pick(args, "lat", cfg, "pv", "lat"), _pick(args, "lon", cfg, "pv", "lon")
+    if lat is None or lon is None:
+        raise CliError("PV needs the location: --lat/--lon or lat/lon in the [pv] section of "
+                       "your local config file")  # fmt: skip
+    try:
+        return PvSystem(
+            _num(lat, "latitude"),
+            _num(lon, "longitude"),
+            arrays,
+            _num(_pick(args, "pv_losses", cfg, "pv", "losses", 14.0), "PV losses"),
+        )
+    except PvError as exc:
+        raise CliError(f"PV: {exc}") from exc
+
+
 def build_battery(args: argparse.Namespace, cfg: Config) -> Battery:
     cap = _pick(args, "capacity", cfg, "battery", "capacity_kwh")
     power = _pick(args, "power", cfg, "battery", "charge_kw")
@@ -420,6 +494,9 @@ def build_battery(args: argparse.Namespace, cfg: Config) -> Battery:
     one_way = math.sqrt(rt / 100)
     dp = _pick(args, "discharge_power", cfg, "battery", "discharge_kw")
     step = _pick(args, "soc_step", cfg, "battery", "soc_step_kwh")
+    inv = _pick(args, "inverter_kw", cfg, "pv", "inverter_kw")
+    if inv is None and pv_arrays(args, cfg):
+        inv = max(_num(power, "power"), _num(power if dp is None else dp, "discharge power"))
     try:
         return Battery(
             capacity_kwh=_num(cap, "capacity"),
@@ -433,6 +510,7 @@ def build_battery(args: argparse.Namespace, cfg: Config) -> Battery:
                 _pick(args, "cycle_cost", cfg, "battery", "cycle_cost_czk_kwh", 0.0), "cycle cost"
             ),
             soc_step_kwh=None if step is None else _num(step, "soc step"),
+            inverter_kw=None if inv is None else _num(inv, "inverter limit"),
         )
     except BatteryError as exc:
         raise CliError(str(exc)) from exc
@@ -530,13 +608,26 @@ def publish_time(args: argparse.Namespace, cfg: Config) -> time | None:
         raise CliError(f"[market] publish_time: {exc}") from exc
 
 
-def ote_client(args: argparse.Namespace) -> OteClient:
-    session = make_session()
+def make_cache(args: argparse.Namespace) -> JsonCache:
     directory = None if args.no_cache else (
         Path(args.cache_dir).expanduser() if args.cache_dir else default_cache_dir()
     )  # fmt: skip
-    cache = JsonCache(directory, warn=warn, refresh=args.refresh_cache)
+    return JsonCache(directory, warn=warn, refresh=args.refresh_cache)
+
+
+def ote_client(args: argparse.Namespace) -> OteClient:
+    session = make_session()
+    cache = make_cache(args)
     return OteClient(session, cache, CnbRates(session, cache))
+
+
+def prefetch_runs(om: OpenMeteo, runs: list[Run], threads: int = 3) -> None:
+    """Download the forecast runs a backtest needs concurrently (cached afterwards)."""
+    todo = [r for r in runs if r not in om._mem]
+    if not todo:
+        return
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        list(pool.map(om.run, todo))
 
 
 def fetch_book(ote: OteClient, start: date, end: date) -> PriceBook:
@@ -606,12 +697,19 @@ def plan_rows(res: PlanResult, b: Battery, tariffs: Tariffs) -> list[dict[str, A
             "soc_end_pct": round(b.pct(st.soc_kwh), 2),
             "cash_czk": round(st.cash_czk - st.wear_czk, 4),
             "fees_czk": round(tariffs.fees_for_quarter(t), 4),
-        })  # fmt: skip
+        } | (_pv_cols(st) if res.problem.pv is not None else {}))  # fmt: skip
         prev = st.soc_kwh
     return rows
 
 
-def _summary(steps: list, fees: float) -> dict[str, float]:
+def _pv_cols(st: Any) -> dict[str, float]:
+    return {
+        "pv_kwh": round(st.pv_kwh, 4), "pv_battery_kwh": round(st.pv_battery_kwh, 4),
+        "pv_grid_kwh": round(st.pv_grid_kwh, 4), "pv_curtailed_kwh": round(st.pv_curtailed_kwh, 4),
+    }  # fmt: skip
+
+
+def _summary(steps: list, fees: float, pv: bool = False) -> dict[str, float]:
     bought = sum(s.grid_kwh for s in steps if s.grid_kwh > 0)
     sold = -sum(s.grid_kwh for s in steps if s.grid_kwh < 0)
     cost = -sum(s.cash_czk for s in steps if s.grid_kwh > 0)
@@ -622,7 +720,12 @@ def _summary(steps: list, fees: float) -> dict[str, float]:
         "sold_kwh": round(sold, 4), "revenue_czk": round(rev, 2),
         "wear_czk": round(wear, 2), "profit_czk": round(rev - cost - wear, 2),
         "fees_czk": round(fees, 2), "net_profit_czk": round(rev - cost - wear - fees, 2),
-    }  # fmt: skip
+    } | ({
+        "pv_kwh": round(sum(s.pv_kwh for s in steps), 4),
+        "pv_battery_kwh": round(sum(s.pv_battery_kwh for s in steps), 4),
+        "pv_grid_kwh": round(sum(s.pv_grid_kwh for s in steps), 4),
+        "pv_curtailed_kwh": round(sum(s.pv_curtailed_kwh for s in steps), 4),
+    } if pv else {})  # fmt: skip
 
 
 def describe_next(st, start: datetime, b: Battery, soc0: float) -> str:  # type: ignore[no-untyped-def]
@@ -651,13 +754,17 @@ def cmd_plan(args: argparse.Namespace) -> int:
     if not live and d0 >= local_today() + timedelta(days=2):
         raise CliError("--at is too far in the future: no prices can be published yet.")
     book = fetch_book(ote_client(args), d0, d0 + timedelta(days=1))
-    res = plan(book, at, soc, tariffs, b, tcfg, publish=pub, use_publication_rule=not live)
+    system = build_pv(args, cfg)
+    pvf, pv_doc = (None, None) if system is None else plan_pv(args, system, at, live)
+    res = plan(book, at, soc, tariffs, b, tcfg, publish=pub, use_publication_rule=not live,
+               pv=pvf)  # fmt: skip
     if not res.steps:
         raise CliError(f"No OTE prices known for {fmt_local(start)} (as of {fmt_local(at)}).")
     if abs(res.soc_kwh - soc) > 1e-9:
         info(f"SoC rounded to the optimiser grid: {b.pct(res.soc_kwh):.2f} %")
     rows = plan_rows(res, b, tariffs)
-    summary = _summary(res.steps, sum(tariffs.fees_for_quarter(t) for t in res.problem.starts))
+    summary = _summary(res.steps, sum(tariffs.fees_for_quarter(t) for t in res.problem.starts),
+                       res.problem.pv is not None)  # fmt: skip
     end = res.problem.starts[-1] + QUARTER
     term = res.problem.terminal
     doc: dict[str, Any] = {
@@ -677,6 +784,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "next": rows[0],
         "summary": summary | {"soc_end_pct": rows[-1]["soc_end_pct"]},
     }  # fmt: skip
+    if pv_doc is not None:
+        doc["pv"] = pv_doc
     by = getattr(args, "breakdown", None)
     fine: list[dict[str, Any]] | None = None
     if by:
@@ -702,6 +811,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for k, v in tariffs.describe().items():
         print(f"{k.capitalize() + ':':<13} {v}")
     print(f"Terminal:     {_terminal_text(term, b)}")
+    if pv_doc is not None:
+        print(f"PV:           {pv_doc['system']}; {pv_doc.get('forecast', '')}")
     print()
     if by == "hour" and fine is not None:
         render_fine(fine, "hour", bool(summary["fees_czk"]))
@@ -712,10 +823,39 @@ def cmd_plan(args: argparse.Namespace) -> int:
           f"CZK, sold {summary['sold_kwh']:.2f} kWh for {summary['revenue_czk']:.2f} CZK, "
           f"wear {summary['wear_czk']:.2f} CZK → profit {summary['profit_czk']:.2f} CZK; "
           f"SoC at the end {rows[-1]['soc_end_pct']:.1f} %")  # fmt: skip
+    if pv_doc is not None:
+        print(f"PV forecast {summary['pv_kwh']:.2f} kWh: → battery "
+              f"{summary['pv_battery_kwh']:.2f}, → grid {summary['pv_grid_kwh']:.2f}, curtailed "
+              f"{summary['pv_curtailed_kwh']:.2f} kWh")  # fmt: skip
     if summary["fees_czk"]:
         print(f"Monthly fees prorated to the horizon: {summary['fees_czk']:.2f} CZK → net "
               f"{summary['net_profit_czk']:.2f} CZK")  # fmt: skip
     return 0
+
+
+def plan_pv(args: argparse.Namespace, system: PvSystem, at: datetime,
+            live: bool) -> tuple[Any, dict[str, Any]]:  # fmt: skip
+    """PV forecast function for ``plan``: live forecast now, or the run known at ``--at``."""
+    om = OpenMeteo(make_session(), make_cache(args), system.lat, system.lon)
+    doc: dict[str, Any] = {"system": system.describe()}
+    if live:
+        energy = system.energy(om.live())
+        doc["forecast"] = "Open-Meteo live forecast (15 min)"
+
+        def live_pv(starts: list[datetime]) -> list[float]:
+            return [energy.get(t, 0.0) for t in starts]
+
+        return live_pv, doc
+    fc = PvForecast(om, system)
+
+    def hist_pv(starts: list[datetime]) -> list[float]:
+        vals, run = fc.at(at, starts)
+        doc["forecast"] = f"Open-Meteo run {run.label}" if run else "no forecast run available"
+        if fc.uncovered:
+            warn(f"PV forecast missing for {fc.uncovered} quarter-hour(s); counted as 0.")
+        return vals
+
+    return hist_pv, doc
 
 
 def plan_quarters(res: PlanResult, tariffs: Tariffs) -> list[Quarter]:
@@ -725,7 +865,8 @@ def plan_quarters(res: PlanResult, tariffs: Tariffs) -> list[Quarter]:
         dist = tariffs.buy_distribution_czk_kwh(t, QUARTER)
         out.append(Quarter(t, float(spot), float(buy), float(sell), st, soc,
                            tariffs.fees_for_quarter(t), dist,
-                           tariffs.low_tariff_fraction(t, QUARTER)))  # fmt: skip
+                           tariffs.low_tariff_fraction(t, QUARTER),
+                           None if p.pv is None else st.pv_kwh))  # fmt: skip
         soc = st.soc_kwh
     return out
 
@@ -754,16 +895,20 @@ def render_fine(rows: list[dict[str, Any]], by: str, fees: bool) -> None:
 
 
 def _plan_table(rows: list[dict[str, Any]], res: PlanResult) -> None:
+    pv = res.problem.pv is not None
+    ph = f" {'PV kWh':>7} {'PV→bat':>7} {'PV→grid':>7}" if pv else ""
     print(f"{'time':<20} {'spot':>9} {'buy':>7} {'sell':>7}  {'action':<9} {'kW':>6} "
-          f"{'grid kWh':>9} {'SoC %':>6} {'CZK':>8}")  # fmt: skip
+          f"{'grid kWh':>9} {'SoC %':>6} {'CZK':>8}{ph}")  # fmt: skip
     print(f"{'(local)':<20} {'CZK/MWh':>9} {'CZK/kWh':>7} {'CZK/kWh':>7}")
     for r, t in zip(rows, res.problem.starts, strict=True):
         spot = "–" if r["spot_czk_mwh"] is None else f"{r['spot_czk_mwh']:.2f}"
         buy = "–" if r["buy_czk_kwh"] is None else f"{r['buy_czk_kwh']:.3f}"
         sell = "–" if r["sell_czk_kwh"] is None else f"{r['sell_czk_kwh']:.3f}"
+        pc = (f" {r['pv_kwh']:>7.3f} {r['pv_battery_kwh']:>7.3f} {r['pv_grid_kwh']:>7.3f}"
+              if pv else "")  # fmt: skip
         print(f"{fmt_local(t):<20} {spot:>9} {buy:>7} {sell:>7}  {r['action']:<9} "
               f"{r['power_kw']:>6.2f} {r['grid_kwh']:>9.3f} {r['soc_end_pct']:>6.1f} "
-              f"{r['cash_czk']:>8.2f}")  # fmt: skip
+              f"{r['cash_czk']:>8.2f}{pc}")  # fmt: skip
 
 
 def _terminal_text(term, b: Battery) -> str:  # type: ignore[no-untyped-def]
@@ -873,7 +1018,8 @@ def backtest_rows(res: BacktestResult, tariffs: Tariffs) -> list[dict[str, Any]]
             "cash_czk": round(st.cash_czk - st.wear_czk, 4),
             "fees_czk": round(tariffs.fees_for_quarter(iv.start), 4),
             "known_until": to_local(iv.horizon_end).isoformat(),
-        })  # fmt: skip
+        } | ({"pv_forecast_kwh": _r(iv.pv_forecast_kwh)} | _pv_cols(st)
+             if res.pv is not None else {}))  # fmt: skip
         prev = st.soc_kwh
     return rows
 
@@ -903,6 +1049,8 @@ def backtest_doc(res: BacktestResult, tariffs: Tariffs, pub: time | None) -> dic
             "profit_incl_stored_energy_czk": round(tot["profit_czk"] + stored_change, 2),
         },
     }  # fmt: skip
+    if res.pv is not None:
+        doc["pv"] = dict(res.pv)
     if res.foresight is not None:
         f = res.foresight.as_dict(b.usable_kwh)
         f_change = ((res.foresight_end_soc_kwh or 0) - res.initial_soc_kwh) * tv
@@ -939,12 +1087,18 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             raise CliError("Nothing to backtest before today.")
     # one extra day: on the last day the next day's prices are published at ~13:05
     book = fetch_book(ote_client(args), start, min(end + timedelta(days=1), today))
+    system = build_pv(args, cfg)
+    replan = _pick(args, "replan", cfg, "pv", "replan", "forecast")
+    if replan not in REPLAN_MODES:
+        raise CliError(f"replan must be one of {', '.join(REPLAN_MODES)}")
+    pvs, pv_info = (None, {}) if system is None else backtest_pv(args, system, start, end,
+                                                                 replan)  # fmt: skip
     info(f"Simulating {start} – {end} ...")
     bar = ProgressBar.create(enabled=not (args.json or args.no_progress))
     try:
         res = run_backtest(book, start, end, tariffs, b, tcfg, soc, publish=pub,
                            foresight=not args.no_foresight, jobs=args.jobs,
-                           progress=bar.update if bar else None)  # fmt: skip
+                           progress=bar.update if bar else None, pv=pvs)  # fmt: skip
     finally:
         if bar:
             bar.close()
@@ -955,6 +1109,8 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     if not res.intervals:
         raise CliError("No OTE prices for the selected period.")
     doc = backtest_doc(res, tariffs, pub)
+    if pvs is not None:
+        doc["pv"] = pv_info | doc.get("pv", {})
     if args.breakdown != "none":
         doc["breakdown"] = {"by": args.breakdown, "rows": res.breakdown(args.breakdown)}
     if args.breakdown_csv:
@@ -973,6 +1129,29 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def backtest_pv(args: argparse.Namespace, system: PvSystem, start: date, end: date,
+                replan: str) -> tuple[PvSetup, dict[str, Any]]:  # fmt: skip
+    """Forecast runs (Open-Meteo) and actual production (nearest ČHMÚ station) for a backtest."""
+    session, cache = make_session(), make_cache(args)
+    om = OpenMeteo(session, cache, system.lat, system.lon)
+    fc = PvForecast(om, system)
+    t0, t1 = local_midnight_utc(start), local_midnight_utc(end + timedelta(days=1))
+    prefetch_runs(om, runs_between(t0 - timedelta(days=2), t1))
+    chmi = Chmi(session, cache)
+    st = chmi.nearest(system.lat, system.lon)
+    actual = system.energy(chmi.irradiance(st.wsi, t0, t1))
+    info(f"PV forecasts: {om.cached} run(s) from cache, {om.downloaded} downloaded; actual: ČHMÚ "
+         f"{st.name} ({st.distance_km:.1f} km), {chmi.downloaded} file(s) downloaded")  # fmt: skip
+    doc = {
+        "system": system.describe(),
+        "forecast": "Open-Meteo single runs as issued: ICON-D2 (15 min, every 3 h, known 2 h "
+        "after the run) from 2026-04-02, ECMWF IFS (hourly, every 6 h, known after 7 h) before",
+        "actual": f"ČHMÚ 10-min global radiation, station {st.name} ({st.distance_km:.1f} km), "
+        "transposed to the arrays",
+    }
+    return PvSetup(fc, actual, system.kwp, replan), doc
+
+
 def render_backtest(doc: dict[str, Any]) -> None:
     p, s = doc["period"], doc["summary"]
     print(f"Backtest {p['from']} – {p['to']} ({p['days']} days)")
@@ -981,6 +1160,11 @@ def render_backtest(doc: dict[str, Any]) -> None:
         if k != "monthly_fees":
             print(f"{k.capitalize() + ':':<13} {v}")
     print(f"Prices:       {doc['publication']}; {doc['optimisations']} re-optimisations")
+    pv = doc.get("pv")
+    if pv:
+        print(f"PV:           {pv['system']}; re-planning: {pv['replan']}")
+        print(f"PV forecast:  {pv['forecast']}")
+        print(f"PV actual:    {pv['actual']}")
     print()
     print(f"Bought        {s['bought_kwh']:>12.2f} kWh   cost     {s['cost_czk']:>12.2f} CZK")
     print(f"Sold          {s['sold_kwh']:>12.2f} kWh   revenue  {s['revenue_czk']:>12.2f} CZK")
@@ -1003,13 +1187,24 @@ def render_backtest(doc: dict[str, Any]) -> None:
         print(f"PROFIT                              {s['profit_czk']:>12.2f} CZK "
               f"({s['profit_per_day_czk']:.2f} CZK/day)")  # fmt: skip
     print(f"Cycles        {s['cycles']:>12.1f} (equivalent full cycles of usable capacity)")
+    if pv:
+        bias = "–" if s["pv_forecast_bias_pct"] is None else f"{s['pv_forecast_bias_pct']:+.1f} %"
+        mae = "–" if s["pv_forecast_mae_pct"] is None else f"{s['pv_forecast_mae_pct']:.1f} %"
+        print(f"PV actual     {s['pv_kwh']:>12.2f} kWh   forecast used {s['pv_forecast_kwh']:.2f} "
+              f"kWh (bias {bias}, quarter-hour MAE {mae}"
+              + (f", daily MAE {pv['daily_mae_pct']:.1f} %" if pv.get("daily_mae_pct") is not None
+                 else "") + ")")  # fmt: skip
+        print(f"PV → battery  {s['pv_battery_kwh']:>12.2f} kWh   PV → grid "
+              f"{s['pv_grid_kwh']:.2f} kWh (revenue {s['pv_revenue_czk']:.2f} CZK), curtailed "
+              f"{s['pv_curtailed_kwh']:.2f} kWh")  # fmt: skip
     print(f"SoC           {doc['soc_start_pct']:.1f} % → {doc['soc_end_pct']:.1f} %"
           f" (stored energy change worth {s['stored_energy_value_change_czk']:.2f} CZK; "
           f"trading profit incl. it {s['profit_incl_stored_energy_czk']:.2f} CZK)")  # fmt: skip
     f = doc.get("perfect_foresight")
     if f:
         cap = f"{f['captured_pct']:.1f} %" if f["captured_pct"] is not None else "–"
-        print(f"Perfect foresight (all prices known in advance): trading profit "
+        what = "all prices and the actual PV" if pv else "all prices"
+        print(f"Perfect foresight ({what} known in advance): trading profit "
               f"{f['profit_incl_stored_energy_czk']:.2f} CZK incl. stored energy, "
               f"{f['cycles']:.1f} cycles; rolling plan captures {cap}")  # fmt: skip
     br = doc.get("breakdown")

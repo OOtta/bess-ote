@@ -59,6 +59,8 @@ class Quarter:
     dist_czk_kwh: float = math.nan
     #: share of the quarter in NT; None = no VT/NT schedule
     low_tariff: float | None = None
+    #: PV forecast the decision was based on; None = no PV
+    pv_forecast_kwh: float | None = None
 
 
 def _mean(values: list[float]) -> float | None:
@@ -87,6 +89,7 @@ def fine_rows(quarters: Iterable[Quarter], battery: Battery, by: str) -> list[di
     for q in quarters:
         key = q.start.replace(minute=0) if by == "hour" else q.start
         groups.setdefault(key, []).append(q)
+    has_pv = any(q.pv_forecast_kwh is not None for q in quarters_list(groups))
     rows = []
     for key in sorted(groups):
         qs = groups[key]
@@ -136,4 +139,17 @@ def fine_rows(quarters: Iterable[Quarter], battery: Battery, by: str) -> list[di
             "fees_czk": round(fees, ND),
             "net_profit_czk": round(revenue - cost - wear - fees, ND),
         })  # fmt: skip
+        if has_pv:
+            rows[-1] |= {
+                "pv_forecast_kwh": round(sum(q.pv_forecast_kwh or 0.0 for q in qs), ND),
+                "pv_kwh": round(sum(s.pv_kwh for s in steps), ND),
+                "pv_battery_kwh": round(sum(s.pv_battery_kwh for s in steps), ND),
+                "pv_grid_kwh": round(sum(s.pv_grid_kwh for s in steps), ND),
+                "pv_curtailed_kwh": round(sum(s.pv_curtailed_kwh for s in steps), ND),
+            }
     return rows
+
+
+def quarters_list(groups: dict[datetime, list[Quarter]]) -> Iterable[Quarter]:
+    for qs in groups.values():
+        yield from qs

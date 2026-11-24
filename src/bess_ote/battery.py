@@ -24,6 +24,9 @@ class Battery:
     * ``soc_min_pct`` / ``soc_max_pct`` – allowed state of charge.
     * ``cycle_cost_czk_kwh`` – wear cost per kWh delivered to the grid (default 0).
     * ``soc_step_kwh`` – resolution of the optimiser's SoC grid (default: see :func:`auto_step`).
+    * ``inverter_kw`` – shared AC limit of a hybrid inverter (PV + battery): grid import
+      (battery charging from the grid) ≤ limit and export (battery discharge + PV to the grid)
+      ≤ limit; PV → battery is DC and does not count. None = no extra limit.
     """
 
     capacity_kwh: float
@@ -35,6 +38,7 @@ class Battery:
     soc_max_pct: float = 100.0
     cycle_cost_czk_kwh: float = 0.0
     soc_step_kwh: float | None = None
+    inverter_kw: float | None = None
 
     def __post_init__(self) -> None:
         if self.capacity_kwh <= 0:
@@ -51,6 +55,8 @@ class Battery:
             raise BatteryError("cycle cost must be ≥ 0")
         if self.soc_step_kwh is not None and not 0 < self.soc_step_kwh <= self.capacity_kwh / 4:
             raise BatteryError("SoC step must be > 0 and ≤ capacity / 4")
+        if self.inverter_kw is not None and self.inverter_kw <= 0:
+            raise BatteryError("inverter limit must be > 0 kW")
 
     @property
     def p_dis(self) -> float:
@@ -69,6 +75,11 @@ class Battery:
     def discharge_q_kwh(self) -> float:
         """Stored energy spent in one quarter-hour at full discharging power."""
         return self.p_dis * DT_H / self.discharge_eff
+
+    @property
+    def inverter_q_kwh(self) -> float:
+        """AC energy the inverter passes in one quarter-hour (inf = no limit)."""
+        return math.inf if self.inverter_kw is None else self.inverter_kw * DT_H
 
     @property
     def step(self) -> float:
@@ -100,6 +111,8 @@ class Battery:
         )
         if self.cycle_cost_czk_kwh:
             text += f", wear {self.cycle_cost_czk_kwh:g} CZK/kWh discharged"
+        if self.inverter_kw is not None:
+            text += f", inverter AC limit {self.inverter_kw:g} kW (PV + battery)"
         return text
 
 

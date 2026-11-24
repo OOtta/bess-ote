@@ -32,6 +32,7 @@ neutrální (násobek 1, přirážka 0, distribuce 0, DPH 0) a použitý vzorec 
   - [Mřížka SoC a plný výkon](#mřížka-soc-a-plný-výkon)
   - [Rychlost a paralelní výpočet (`--jobs`)](#rychlost-a-paralelní-výpočet---jobs)
 - [Zveřejňování cen OTE a backtest](#zveřejňování-cen-ote-a-backtest)
+- [Fotovoltaika (FVE)](#fotovoltaika-fve)
 - [Výstupy](#výstupy)
   - [Rozpis po hodinách a čtvrthodinách](#rozpis-po-hodinách-a-čtvrthodinách)
 - [Konfigurační soubor](#konfigurační-soubor)
@@ -211,6 +212,16 @@ pro oba příkazy (kromě posledních dvou tabulek).
 | `-j`, `--jobs N` | počet paralelních procesů pro výpočet (výchozí `auto` = počet jader CPU, `1` = sériově); výsledek je pro každé N **stejný** – viz [Rychlost a paralelní výpočet](#rychlost-a-paralelní-výpočet---jobs) |
 | `--no-progress` | nezobrazovat průběh výpočtu (viz níže) |
 | `-o FILE` | všechny čtvrthodiny do `.csv`, nebo vše (souhrn, rozpis, čtvrthodiny) do `.json` |
+
+**Fotovoltaika** (plan i backtest, podrobně v [Fotovoltaika (FVE)](#fotovoltaika-fve)):
+
+| Volba | Význam | Výchozí |
+|---|---|---|
+| `--pv-array AZ,SKLON,KWP` | jedno pole panelů: azimut ° (0 = jih, −90 = východ, 90 = západ), sklon ° (0 = vodorovně), výkon kWp; opakujte pro další pole. Záporný azimut pište se `=`: `--pv-array=-90,20,3` | bez FVE |
+| `--lat ST`, `--lon ST` | poloha FVE (zeměpisná šířka / délka); **jen lokálně** – v příkazu nebo ve vlastním configu | povinné s FVE |
+| `--pv-losses PCT` | systémové ztráty (kabely, střídač, znečištění, …) | 14 |
+| `--inverter-kw KW` | společný AC limit hybridního střídače pro odběr ze sítě i dodávku do sítě (FVE + baterie) | s FVE max(`-p`, `--discharge-power`), bez FVE žádný |
+| `--replan publication\|forecast\|quarter` | (backtest) kdy přeplánovat – viz [Přeplánování](#přeplánování---replan) | `forecast` |
 
 **Průběh výpočtu.** Backtest delšího období trvá i desítky sekund, proto během výpočtu
 ukazuje na stderr jednoduchý řádek s procenty, počtem zpracovaných dní a odhadem zbývajícího
@@ -482,6 +493,73 @@ rozhodnutí jsou přitom bit po bitu stejná, jako by v každé čtvrthodině b�
 cen. Oba výsledky se porovnávají včetně změny hodnoty energie v baterii (ocenění jako
 `--terminal value`); poměr ukazuje, kolik z teoretického maxima klouzavý plán získal.
 
+## Fotovoltaika (FVE)
+
+S volbou `--pv-array` (jednou nebo vícekrát) počítá `plan` i `backtest` s výrobou FVE na
+stejném hybridním střídači jako baterie:
+
+```bash
+# Plán na teď s FVE 5 kWp na jih se sklonem 35° (obecný bod v Praze)
+bess-ote plan -c 10 -p 5 --soc 40 --pv-array 0,35,5 --lat 50.0755 --lon 14.4378
+
+# Dvě pole (jih 4 kWp a východ 2 kWp), ztráty 12 %, střídač 6 kW, backtest s přeplánováním
+# po každé čtvrthodině
+bess-ote backtest -c 10 -p 5 --from 2026-06 --to 2026-10 \
+  --pv-array 0,35,4 --pv-array=-90,20,2 --pv-losses 12 --inverter-kw 6 \
+  --lat 50.0755 --lon 14.4378 --replan quarter
+```
+
+Polohu necommitujte – patří do příkazové řádky nebo do vlastního konfiguračního souboru
+(sekce `[pv]`, viz [Konfigurační soubor](#konfigurační-soubor)).
+
+**Model.** Energie z FVE je „nákup za 0 Kč“ a optimalizátor v každé čtvrthodině sám zvolí
+nejvýhodnější využití: nabít baterii, prodat do sítě (výkupní cena podle vašeho vzorce) nebo
+výrobu omezit (typicky při záporné výkupní ceně). Spotřeba domu se nezapočítává. Baterii lze
+dál nabíjet i ze sítě a FVE se kombinuje s nákupem a prodejem:
+
+- FVE → baterie je na straně DC, do limitu střídače se nepočítá; platí nabíjecí výkon baterie
+  `-p` a účinnost nabíjení.
+- Společný AC limit `--inverter-kw` omezuje **odběr ze sítě** (nabíjení ze sítě) a **dodávku do
+  sítě** (vybíjení baterie + přetoky FVE dohromady).
+- Výroba se nejdřív použije na plánované nabíjení, zbytek se prodá (jen při kladné výkupní ceně
+  a do limitu střídače), zbytek se omezí.
+- Bez FVE (nebo s nulovou výrobou) jsou výsledky **bit po bitu stejné** jako dřív (ověřuje test).
+
+Výroba se počítá z ozáření: horizontální globální a difuzní záření → poloha Slunce (NOAA) →
+transpozice na rovinu panelů (izotropní obloha, albedo 0,2) → teplota článků (NOCT 45 °C,
+−0,4 %/K) → kWp × (1 − ztráty). Pro difuzní složku z měření se použije rozklad Erbs.
+
+**Předpověď a skutečnost (bez klíčů a registrace, vše v mezipaměti):**
+
+| | Zdroj |
+|---|---|
+| `plan` (teď) | Open-Meteo Forecast API, 15minutové hodnoty (`minutely_15`) |
+| `plan --at`, `backtest` – předpověď | Open-Meteo **Single Runs API** = předpovědi přesně tak, jak byly vydány: **ICON-D2** (15 min, běhy po 3 h, dostupné 2 h po běhu) od 2. 4. 2026, předtím **ECMWF IFS** (hodinově, běhy po 6 h, dostupné 7 h po běhu). V čase `t` se použije nejnovější běh dostupný do `t`, mezery doplní starší běhy |
+| `backtest` – skutečnost | ČHMÚ otevřená data, 10minutové globální záření (`RGLB10`) a teplota z **nejbližší stanice** k zadané poloze, zprůměrované na čtvrthodiny a transponované na každé pole |
+
+Předpovědi se **nekorigují** (žádná korekce biasu). Vyúčtování v backtestu probíhá vždy podle
+skutečné výroby: plán se provede, a když FVE vyrobí méně, než plán čekal, sníží se nabíjení
+(nákup ze sítě nad plán se nedělá); když vyrobí víc, přebytek se prodá nebo – je-li prodej
+nevýhodný – uloží do baterie, jinak omezí. Souhrn uvádí chybu předpovědi (bias, MAE po
+čtvrthodinách a po dnech) a srovnání s ideálem počítá s dokonalou znalostí cen **i skutečné
+výroby**.
+
+### Přeplánování (`--replan`)
+
+Ve všech režimech se v čase `t` používají jen informace dostupné do `t` (ceny i běhy
+předpovědí) a rozhodnutí v backtestu je stejné jako `plan --at t` se stejnou předpovědí
+(ověřuje test).
+
+| Režim | Kdy se přepočítá plán |
+|---|---|
+| `publication` | jen při zveřejnění nových cen OTE (≈ jednou denně), s předpovědí platnou v tu chvíli |
+| `forecast` (výchozí) | navíc pokaždé, když vyjde novější běh předpovědi (ICON-D2 každé 3 h) |
+| `quarter` | každou čtvrthodinu: nejnovější předpověď + skutečná výroba do teď (poměr skutečnost/předpověď poslední čtvrthodiny upraví následující 2 h, lineárně slábne) |
+
+Výstupy s FVE: v souhrnu skutečná a předpovězená výroba, FVE → baterie / síť / omezeno,
+tržba za přetoky FVE a chyba předpovědi; v rozpisech, CSV a JSON sloupce `pv_forecast_kwh`,
+`pv_kwh`, `pv_battery_kwh`, `pv_grid_kwh`, `pv_curtailed_kwh` (v JSON navíc objekt `pv`).
+
 ## Výstupy
 
 - **Text** – souhrn a tabulka (časy v místním čase s označením CET/CEST).
@@ -612,6 +690,14 @@ monthly_fee = 257     # Kč/měsíc bez DPH (jistič …)
 hours = "1:15-5:15,12:30-16:30"
 hours_weekend = "2:45-6:45,13:00-17:00"
 holidays = "weekend"
+
+[pv]                  # jen ve vlastním lokálním souboru – poloha se necommituje
+lat = 50.0755
+lon = 14.4378
+arrays = [[0, 35, 4], [-90, 20, 2]]   # [azimut, sklon, kWp], nebo {azimuth=…, tilt=…, kwp=…}
+losses = 14
+# inverter_kw = 6
+# replan = "quarter"
 ```
 
 ## Data a mezipaměť
@@ -623,17 +709,24 @@ holidays = "weekend"
   minulé dny (přesný počet period včetně přechodu na letní/zimní čas), dnešek a budoucí dny se
   vždy stahují znovu. `--no-cache` mezipaměť vypne, `--refresh-cache` vše stáhne znovu.
   Opakovaný backtest za stejné období tak OTE vůbec nekontaktuje.
+- FVE: běhy předpovědí Open-Meteo a měsíční/denní soubory ČHMÚ se ukládají do stejné
+  mezipaměti (podsložka `pv`); živá předpověď pro `plan` bez `--at` se stahuje vždy znovu.
+  Open-Meteo omezuje souběžné dotazy (HTTP 429) – stahuje se nejvýš 3 vlákny s opakováním.
 
 ## Omezení
 
-- Model je **čistá arbitráž se sítí**: nezohledňuje vlastní spotřebu domácnosti ani FVE (energie
-  z baterie se prodává, do baterie se nakupuje). Pro baterii za elektroměrem s vlastní spotřebou
+- Model je **arbitráž se sítí** (volitelně s FVE): nezohledňuje vlastní spotřebu domácnosti
+  (energie z baterie se prodává, do baterie se nakupuje nebo nabíjí z FVE). Pro baterii za elektroměrem s vlastní spotřebou
   je skutečný přínos jiný (vybíjení do spotřeby šetří celou nákupní cenu včetně distribuce).
 - Rezervovaný příkon, jistič a limity přetoků distributora se nekontrolují – nastavte výkon
   baterie odpovídajícím způsobem.
 - Ceny denního trhu jsou známé jen den dopředu; vnitrodenní trh a regulační energie se
   nemodelují.
 - Účinnost je konstantní (nezávislá na výkonu a SoC), samovybíjení se zanedbává.
+- FVE: zjednodušený fyzikální model (izotropní obloha, bez stínění, sněhu a degradace); stanice
+  ČHMÚ může být od FVE vzdálená a výpadky jejích dat se nahradí předpovědí (s varováním).
+  Mřížka SoC je diskrétní, takže s FVE může u baterií s různým krokem mřížky vyjít ideál o
+  zlomek procenta mimo monotonii vůči kapacitě.
 - Zpožděné zveřejnění cen (SDAC delay, nejpozději 14:20) se v backtestu nemodeluje
   automaticky; použijte `--publish-time`.
 
@@ -645,7 +738,8 @@ pip install -e ".[dev]"
 ruff check . && ruff format --check . && pytest
 ```
 
-Testy používají jen syntetické ceny a zfalšovanou službu OTE (bez sítě).
+Testy používají jen syntetické ceny, syntetickou výrobu FVE a zfalšované služby OTE,
+Open-Meteo a ČHMÚ (bez sítě).
 
 ```text
 src/bess_ote/
@@ -655,7 +749,9 @@ src/bess_ote/
   backtest.py     klouzavá simulace a srovnání s ideálem
   market.py       čtvrthodinová řada cen, časy zveřejnění OTE
   tariff.py       nákup, výkup, distribuce, DPH
-  battery.py      parametry baterie
+  battery.py      parametry baterie (vč. limitu střídače)
+  pv.py           model FVE: poloha Slunce, transpozice, teplota, ztráty
+  pvdata.py       předpovědi Open-Meteo (ICON-D2/IFS, live) a měření ČHMÚ s mezipamětí
   ote.py, cnb.py  ceny OTE (SOAP) a kurzy ČNB s mezipamětí (převzato z egd-api-client)
   cache.py, lowtariff.py, timeutil.py, config.py, http.py, models.py
 ```

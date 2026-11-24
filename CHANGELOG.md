@@ -4,6 +4,33 @@
 
 First version of **bess-ote** (BESS OTE kalkulačka).
 
+- **Solar PV (FVE)** on the same hybrid inverter, in `plan` and `backtest`:
+  - `--pv-array AZ,TILT,KWP` (repeatable; azimuth 0 = south, −90 = east; write
+    `--pv-array=-90,20,2` for a negative azimuth), `--lat/--lon` (CLI or local config only),
+    `--pv-losses` (default 14 %), `--inverter-kw` (shared AC limit for grid import and export
+    of PV + battery; default with PV = max of charge/discharge power). Config section `[pv]`.
+  - PV energy is free: the DP chooses per quarter-hour between charging the battery (DC, not
+    counted against the inverter limit), selling at the sell formula and curtailing (e.g.
+    negative sell price); grid charging and discharging stay available. Zero PV / no PV is
+    bit-identical to before (tested), DP vs a continuous LP bound tested.
+  - PV model: NOAA sun position, isotropic-sky transposition with albedo 0.2, Erbs diffuse
+    split for measured GHI, NOCT cell temperature (−0.4 %/K), system losses.
+  - Forecasts (keyless, cached): Open-Meteo 15-minute forecast for live `plan`; Open-Meteo
+    Single Runs as issued for `plan --at` and backtests – ICON-D2 (every 3 h, available 2 h
+    after the run) from 2026-04-02, ECMWF IFS (every 6 h, +7 h) before; gaps filled from older
+    runs. Throttling (HTTP 429) and 5xx are retried with back-off, at most 3 download threads.
+  - Actuals: ČHMÚ open data, 10-minute global radiation and temperature of the nearest
+    station, averaged to quarter-hours and transposed to each array; the backtest always
+    settles on actual production (shortfall reduces charging, surplus is sold, stored or
+    curtailed), no bias correction.
+  - `backtest --replan publication|forecast|quarter`: re-plan only at OTE publications, also at
+    each new forecast run (default), or every quarter-hour with a nowcast from actual
+    production; only information available at the decision time is used and the decision at
+    `t` equals `plan --at t` (tested); serial and parallel results identical.
+  - Outputs: PV actual vs forecast (bias, quarter-hour and daily MAE), PV → battery / grid /
+    curtailed, PV export revenue; breakdown, CSV and JSON columns `pv_forecast_kwh`,
+    `pv_kwh`, `pv_battery_kwh`, `pv_grid_kwh`, `pv_curtailed_kwh`, JSON object `pv`; perfect
+    foresight knows prices and actual PV.
 - `bess-ote plan`: optimal charge / discharge / wait schedule of a battery from the next
   quarter-hour over all OTE day-ahead prices published at that moment (live, or `--at` a past
   moment with the publication rule); `--next` prints only the next action; text, `--json`,

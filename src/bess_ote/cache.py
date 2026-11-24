@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 #: cache namespaces written by this package
-NAMESPACES = ("ote", "cnb")
+NAMESPACES = ("ote", "cnb", "pv")
 LEGACY_NAMESPACES: tuple[str, ...] = ()
 
 
