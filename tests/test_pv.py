@@ -458,6 +458,9 @@ def test_cli_plan_at_with_pv_and_config(pv_http, capsys, tmp_path):
     assert doc["pv"]["forecast"].startswith("Open-Meteo run ecmwf_ifs 2025-10-14 00")
     assert "inverter AC limit 4 kW" in doc["battery"]
     assert doc["summary"]["pv_kwh"] > 0 and "pv_battery_kwh" in doc["intervals"][0]
+    rc = main(["plan", *BAT, "--config", str(cfg), "--at", "2025-10-14 13:20", "--next"])
+    nxt = capsys.readouterr().out.splitlines()[1]
+    assert rc == 0 and nxt.startswith("NEXT 13:30–13:45") and "→ battery" in nxt, nxt
 
 
 def test_cli_pv_needs_location(pv_http, capsys):

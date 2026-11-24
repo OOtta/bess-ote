@@ -30,7 +30,8 @@ First version of **bess-ote** (BESS OTE kalkulačka).
   - Outputs: PV actual vs forecast (bias, quarter-hour and daily MAE), PV → battery / grid /
     curtailed, PV export revenue; breakdown, CSV and JSON columns `pv_forecast_kwh`,
     `pv_kwh`, `pv_battery_kwh`, `pv_grid_kwh`, `pv_curtailed_kwh`, JSON object `pv`; perfect
-    foresight knows prices and actual PV.
+    foresight knows prices and actual PV. `plan` NEXT line shows the PV split; mixed hours in
+    breakdowns with PV are labelled by the battery direction (not the grid flow).
 - `bess-ote plan`: optimal charge / discharge / wait schedule of a battery from the next
   quarter-hour over all OTE day-ahead prices published at that moment (live, or `--at` a past
   moment with the publication rule); `--next` prints only the next action; text, `--json`,

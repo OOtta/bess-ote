@@ -731,6 +731,20 @@ def _summary(steps: list, fees: float, pv: bool = False) -> dict[str, float]:
 def describe_next(st, start: datetime, b: Battery, soc0: float) -> str:  # type: ignore[no-untyped-def]
     span = f"{to_local(start):%H:%M}–{to_local(start + QUARTER):%H:%M}"
     soc = f"SoC {b.pct(soc0):.1f} % → {b.pct(st.soc_kwh):.1f} %"
+    if st.pv_kwh > 0:  # with PV the grid flow is not the battery flow
+        grid_in = (
+            st.grid_kwh + (st.delta_kwh < 0) * -st.delta_kwh * b.discharge_eff + st.pv_grid_kwh
+        )
+        pv = (f"PV {st.pv_kwh:.3f} kWh: {st.pv_battery_kwh:.3f} → battery, {st.pv_grid_kwh:.3f} → "
+              f"grid, {st.pv_curtailed_kwh:.3f} curtailed")  # fmt: skip
+        if st.action == "charge":
+            kw = st.delta_kwh / b.charge_eff / DT_H
+            return (f"{span}  CHARGE {kw:.2f} kW ({grid_in:.3f} kWh from grid, "
+                    f"{st.pv_battery_kwh:.3f} kWh from PV), {pv}, {soc}")  # fmt: skip
+        if st.action == "discharge":
+            kw = -st.delta_kwh * b.discharge_eff / DT_H
+            return f"{span}  DISCHARGE {kw:.2f} kW to grid, {pv}, {soc}"
+        return f"{span}  WAIT, {pv}, {soc}"
     if st.action == "charge":
         return f"{span}  CHARGE {st.power_kw:.2f} kW ({st.grid_kwh:.3f} kWh from grid), {soc}"
     if st.action == "discharge":

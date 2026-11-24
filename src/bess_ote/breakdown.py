@@ -107,7 +107,10 @@ def fine_rows(quarters: Iterable[Quarter], battery: Battery, by: str) -> list[di
         elif all(c == pattern[0] for c in pattern):
             action = qs[0].step.action  # type: ignore[union-attr]
         else:
-            action = "charge" if grid > 0 else "discharge" if grid < 0 else "wait"
+            net = grid
+            if any(s.pv_kwh > 0 for s in steps):  # with PV the grid flow ≠ the battery flow
+                net = sum(s.delta_kwh for s in steps)
+            action = "charge" if net > 0 else "discharge" if net < 0 else "wait"
             action = f"mixed ({action})" if ("C" in pattern and "D" in pattern) else action
         last = qs[-1]
         soc_end = last.step.soc_kwh if last.step is not None else last.soc_before_kwh

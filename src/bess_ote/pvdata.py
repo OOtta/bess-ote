@@ -49,7 +49,6 @@ MODELS = {
     "icon_d2": ModelSpec("icon_d2", 3, timedelta(hours=2), True, 48),
     "ecmwf_ifs": ModelSpec("ecmwf_ifs", 6, timedelta(hours=7), False, 72),
 }
-#: older runs used to fill quarters the newest run does not cover
 RETRY_DELAYS_S = (2, 5, 10, 20, 40, 60)  # Open-Meteo throttles bursts with HTTP 429
 RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 _sleep = time.sleep  # patched in tests
@@ -67,6 +66,7 @@ def get_with_retry(
     raise AssertionError("unreachable")
 
 
+#: older runs used to fill quarters the newest run does not cover
 FALLBACK_RUNS = 4
 
 

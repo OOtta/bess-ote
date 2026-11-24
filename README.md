@@ -560,6 +560,36 @@ Výstupy s FVE: v souhrnu skutečná a předpovězená výroba, FVE → baterie 
 tržba za přetoky FVE a chyba předpovědi; v rozpisech, CSV a JSON sloupce `pv_forecast_kwh`,
 `pv_kwh`, `pv_battery_kwh`, `pv_grid_kwh`, `pv_curtailed_kwh` (v JSON navíc objekt `pv`).
 
+**Ukázka – červen–říjen 2026** (153 dní, baterie a tarify jako v
+[Rychlém startu](#rychlý-start) bez měsíčních poplatků, `--soc 10`; FVE 5 kWp jih/35°, obecný
+bod v Praze, skutečnost ze stanice ČHMÚ Praha-Karlov, 2 932,7 kWh):
+
+```bash
+bess-ote backtest -c 10 -p 5 --efficiency 90 --soc-min 10 --soc 10 -a 400 --sell-add -300 \
+  --buy-vat 21 --distribution-high 2.435 --distribution-low 0.416 \
+  --low-tariff-hours 1:15-5:15,12:30-16:30 --low-tariff-hours-weekend 2:45-6:45,13:00-17:00 \
+  --holidays weekend --pv-array 0,35,5 --lat 50.0755 --lon 14.4378 \
+  --replan forecast --from 2026-06 --to 2026-10
+```
+
+| Varianta | Zisk Kč (vč. energie v baterii) | Optimalizací | Chyba předpovědi: bias / MAE čtvrthodin / MAE dnů | Čas běhu |
+|---|---:|---:|---|---:|
+| bez FVE | 3 326,27 | 154 | – | 3,4 s |
+| `--replan publication` | 10 011,91 | 154 | −0,8 % / 25,1 % / 10,2 % | 6,5 s |
+| `--replan forecast` | 10 024,60 | 1 375 | −2,4 % / 23,0 % / 8,7 % | 8,0 s |
+| `--replan quarter` | 10 041,90 | 7 914 | +0,9 % / 18,5 % / 1,4 % ¹ | 23,0 s |
+| klouzavě s dokonalou předpovědí FVE (předpověď = skutečnost) ² | 10 190,69 | 157 | 0 | 5,5 s |
+| ideál (všechny ceny i skutečná výroba předem) | 10 202,97 | 1 | – | – |
+
+¹ U `quarter` je „použitá předpověď“ už opravená skutečnou výrobou předchozí čtvrthodiny.
+² Jen pro srovnání (skript mimo CLI). Časy: 8 jader, předpovědi v mezipaměti; první běh
+stahoval 1 169 běhů předpovědí z Open-Meteo kvůli omezení rychlosti ≈ 6 min.
+
+FVE přidala ≈ 6 700 Kč, nákup ze sítě klesl z 1 315 na ≈ 207 kWh; s `--replan forecast` šlo
+1 475,5 kWh FVE do baterie, 1 219,2 kWh do sítě (3 051 Kč) a 238,0 kWh bylo omezeno
+(záporné výkupní ceny, plná baterie a limit střídače). Nepřesnost předpovědi stojí ≈ 1,6 %
+oproti dokonalé předpovědi.
+
 ## Výstupy
 
 - **Text** – souhrn a tabulka (časy v místním čase s označením CET/CEST).
